@@ -1,0 +1,35 @@
+Web-Buildin-decoder
+Copyright (c) 2026 Roshan-Here (https://github.com/Roshan-Here)
+Licensed under the MIT License (see LICENSE).
+
+If you use it, please keep this notice and credit the author:
+
+    Video decoding by Web-Buildin-decoder by Roshan-Here
+    https://github.com/Roshan-Here/Web-Buildin-decoder
+
+-------------------------------------------------------------------------------
+Third-party software
+-------------------------------------------------------------------------------
+
+This package does not bundle any third-party code. It drives the following
+software, which your application installs and ships under its own licence:
+
+movi-player (peer dependency), Copyright 2026 Ujjawal Kashyap
+  https://github.com/mrujjwalg/movi-player
+  Licensed under the Apache License, Version 2.0.
+  Its WebAssembly file, movi.wasm, contains:
+
+  FFmpeg  https://ffmpeg.org
+    Built without its GPL parts, and so licensed under the GNU Lesser General
+    Public License, version 2.1 or later. Keep movi.wasm as a separate file that
+    people can replace with another build of the same version, and include
+    FFmpeg's licence with your application.
+
+  dav1d  https://code.videolan.org/videolan/dav1d
+    Licensed under the BSD 2-Clause License.
+
+  movi-player's own LICENSE file lists further components it includes (such as
+  signalsmith-stretch, MIT); their notices travel with it.
+
+An application that ships movi-player must include the Apache-2.0 licence and
+the FFmpeg and dav1d notices with it, in addition to this notice.

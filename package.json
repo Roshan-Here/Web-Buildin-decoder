@@ -1,0 +1,78 @@
+{
+  "name": "web-buildin-decoder",
+  "version": "0.1.0",
+  "description": "A built-in video decoder for the web: plays MKV, HEVC, AC-3, DTS, multi-track audio and embedded subtitles in any modern browser, under your own player controls.",
+  "keywords": [
+    "video",
+    "decoder",
+    "player",
+    "mkv",
+    "matroska",
+    "hevc",
+    "h265",
+    "ac3",
+    "dts",
+    "subtitles",
+    "webassembly",
+    "ffmpeg",
+    "webcodecs",
+    "range-requests"
+  ],
+  "author": "Roshan-Here (https://github.com/Roshan-Here)",
+  "license": "MIT",
+  "homepage": "https://github.com/Roshan-Here/Web-Buildin-decoder#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Roshan-Here/Web-Buildin-decoder.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Roshan-Here/Web-Buildin-decoder/issues"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "check": "npm run typecheck && npm run format:check && npm test && npm run build",
+    "example": "vite examples/basic",
+    "prepublishOnly": "npm run check",
+    "fixtures": "sh scripts/fixtures.sh",
+    "test:browser": "node scripts/browser-check.mjs"
+  },
+  "peerDependencies": {
+    "movi-player": ">=0.4.1 <0.5.0"
+  },
+  "devDependencies": {
+    "movi-player": "0.4.1",
+    "playwright": "^1.56.0",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
