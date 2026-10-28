@@ -112,77 +112,64 @@ describe('ChunkedSource', () => {
       return { fetchChunk, aborted, release }
     }
 
-    it('calls off read ahead on its way when the reader seeks out of its window', async () => {
-      const { fetchChunk, aborted, release } = slowFile()
+    /** Plays chunk 0 and gets chunk 1 in hand, so chunks 2 and 3 are on their way ahead. */
+    async function playingWithTwoAhead(readAhead: number) {
+      const file = slowFile()
       const source = new ChunkedSource({
         size: 100 * 1024,
         chunkSize: 1024,
-        fetchChunk,
-        readAhead: 4,
+        fetchChunk: file.fetchChunk,
+        readAhead,
         concurrency: 2,
       })
       const first = source.read(0, 10)
-      release(0)
+      file.release(0)
       await first
-      // Chunks 1 and 2 are downloading ahead.
-      await vi.waitFor(() => expect(fetchChunk).toHaveBeenCalledTimes(3))
+      await vi.waitFor(() => expect(file.fetchChunk).toHaveBeenCalledTimes(2))
+      file.release(1)
+      await vi.waitFor(() =>
+        expect(file.fetchChunk).toHaveBeenCalledTimes(Math.min(readAhead, 3) + 1),
+      )
+      return { ...file, source }
+    }
+
+    it('calls off read ahead on its way when the reader seeks out of its window', async () => {
+      const { source, fetchChunk, aborted, release } = await playingWithTwoAhead(4)
       const seek = source.read(60 * 1024, 10)
-      expect(aborted.sort((a, b) => a - b)).toEqual([1, 2])
+      expect(aborted.sort((a, b) => a - b)).toEqual([2, 3])
       release(60)
       expect(await seek).toEqual(new Uint8Array(10).fill(60))
-      // The connections went to the new place: its read ahead started, the old never resumed.
-      await vi.waitFor(() =>
-        expect(fetchChunk.mock.calls.map((c) => c[0])).toEqual(expect.arrayContaining([61, 62])),
-      )
-      expect(fetchChunk.mock.calls.filter((c) => c[0] === 3)).toEqual([])
+      // The link went to the new place: its read ahead started, the old never resumed.
+      await vi.waitFor(() => expect(fetchChunk.mock.calls.map((c) => c[0])).toContain(61))
+      release(61)
+      await vi.waitFor(() => expect(fetchChunk.mock.calls.map((c) => c[0])).toContain(62))
+      expect(fetchChunk.mock.calls.filter((c) => c[0] === 4)).toEqual([])
     })
 
-    it('keeps read ahead that a read is waiting for, and what is still ahead of the new read', async () => {
-      const { fetchChunk, aborted, release } = slowFile()
-      const source = new ChunkedSource({
-        size: 100 * 1024,
-        chunkSize: 1024,
-        fetchChunk,
-        readAhead: 4,
-        concurrency: 2,
-      })
-      const first = source.read(0, 10)
-      release(0)
-      await first
-      await vi.waitFor(() => expect(fetchChunk).toHaveBeenCalledTimes(3))
-      // The reader moves on to chunk 1, which is already downloading: nothing is called off.
-      const next = source.read(1024, 10)
-      // And a seek elsewhere now does not call off chunk 1, which that read waits for.
+    it('keeps read ahead that a read is waiting for', async () => {
+      const { source, aborted, release } = await playingWithTwoAhead(4)
+      // The reader moves on to chunk 2, which is already downloading: nothing is called off.
+      const next = source.read(2 * 1024, 10)
+      // And a seek elsewhere now calls off chunk 3, but not chunk 2, which that read waits for.
       const other = source.read(50 * 1024, 10)
-      expect(aborted).toEqual([2])
-      release(1)
+      expect(aborted).toEqual([3])
+      release(2)
       release(50)
-      expect(await next).toEqual(new Uint8Array(10).fill(1))
+      expect(await next).toEqual(new Uint8Array(10).fill(2))
       expect(await other).toEqual(new Uint8Array(10).fill(50))
     })
 
     it('downloads a called-off chunk again when it is read after all', async () => {
-      const { fetchChunk, release } = slowFile()
-      const source = new ChunkedSource({
-        size: 100 * 1024,
-        chunkSize: 1024,
-        fetchChunk,
-        readAhead: 2,
-        concurrency: 2,
-      })
-      const first = source.read(0, 10)
-      release(0)
-      await first
-      await vi.waitFor(() => expect(fetchChunk).toHaveBeenCalledTimes(3))
+      const { source, fetchChunk, release } = await playingWithTwoAhead(2)
       const seek = source.read(40 * 1024, 10)
       release(40)
       await seek
-      const back = source.read(1024, 10)
+      const back = source.read(2 * 1024, 10)
       await vi.waitFor(() =>
-        expect(fetchChunk.mock.calls.filter((c) => c[0] === 1)).toHaveLength(2),
+        expect(fetchChunk.mock.calls.filter((c) => c[0] === 2)).toHaveLength(2),
       )
-      release(1)
-      expect(await back).toEqual(new Uint8Array(10).fill(1))
+      release(2)
+      expect(await back).toEqual(new Uint8Array(10).fill(2))
     })
   })
 
@@ -287,27 +274,128 @@ describe('ChunkedSource', () => {
     })
   })
 
+  describe('scheduling', () => {
+    /** Downloads that finish when the test lets them through. */
+    function heldFile() {
+      const waiting = new Map<number, () => void>()
+      const fetchChunk = vi.fn(
+        (index: number, chunkSize: number, signal?: AbortSignal) =>
+          new Promise<Uint8Array>((resolve, reject) => {
+            waiting.set(index, () => resolve(new Uint8Array(chunkSize).fill(index % 251)))
+            signal?.addEventListener('abort', () => reject(signal.reason))
+          }),
+      )
+      const release = async (index: number) => {
+        waiting.get(index)?.()
+        await new Promise((r) => setTimeout(r, 0))
+      }
+      const started = () => fetchChunk.mock.calls.map((c) => c[0])
+      return { fetchChunk, release, started }
+    }
+
+    it('gives a read playback waits for the link: read ahead starts once it has arrived', async () => {
+      const { fetchChunk, release, started } = heldFile()
+      const source = new ChunkedSource({
+        size: 100 * 1024,
+        chunkSize: 1024,
+        fetchChunk,
+        readAhead: 4,
+        concurrency: 2,
+      })
+      const read = source.read(50 * 1024, 10)
+      expect(started()).toEqual([50])
+      await release(50)
+      await read
+      // Nothing in hand yet: strictly the next chunk first.
+      expect(started()).toEqual([50, 51])
+      await release(51)
+      // A chunk in hand: two overlap.
+      expect(started()).toEqual([50, 51, 52, 53])
+    })
+
+    it('holds back prefetch while playback waits, and keeps it out of read ahead’s way', async () => {
+      const { fetchChunk, release, started } = heldFile()
+      const source = new ChunkedSource({
+        size: 100 * 1024,
+        chunkSize: 1024,
+        fetchChunk,
+        readAhead: 2,
+        concurrency: 2,
+      })
+      source.prefetch([0, 99, 1])
+      expect(started()).toEqual([0, 99])
+      // Playback asks for the header while it is on its way: it waits, nothing new starts.
+      const read = source.read(0, 10)
+      await release(99)
+      expect(started()).toEqual([0, 99])
+      await release(0)
+      await read
+      // Then the rest of the prefetch, before read ahead.
+      expect(started()[2]).toBe(1)
+    })
+
+    it('lets previews go first while playback has chunks in hand, but never starves it', async () => {
+      const { fetchChunk, release, started } = heldFile()
+      const source = new ChunkedSource({
+        size: 100 * 1024,
+        chunkSize: 1024,
+        fetchChunk,
+        readAhead: 6,
+        concurrency: 2,
+      })
+      const side = source.createSideReader()
+      // Playback with nothing in hand: a preview read does not stop its read ahead.
+      const first = source.read(0, 10)
+      await release(0)
+      await first
+      const preview = side.read(80 * 1024, 10)
+      expect(started()).toEqual([0, 1, 80])
+      await release(1)
+      // One chunk in hand now, the preview still waiting: read ahead carries on.
+      expect(started()).toContain(2)
+      await release(80)
+      await preview
+      await release(2)
+      await release(3)
+      // Two in hand: a new preview read pauses the read ahead until it has its chunk.
+      const [a, b] = started().slice(-2)
+      const before = started().length
+      const second = side.read(90 * 1024, 10)
+      await release(a!)
+      await release(b!)
+      expect(started().slice(before)).toEqual([90])
+      await release(90)
+      await second
+      expect(started().length).toBeGreaterThan(before + 1)
+    })
+  })
+
   describe('prefetch', () => {
-    it('downloads the chunks asked for at once, and reads then come from the cache', async () => {
+    it('downloads the chunks asked for in order, a couple at a time, then reads come cached', async () => {
       const { fetchChunk } = remoteFile(64 * 1024, 1024)
       const source = new ChunkedSource({
         size: 64 * 1024,
         chunkSize: 1024,
         fetchChunk,
         readAhead: 0,
+        concurrency: 2,
       })
-      source.prefetch([0, 1, 63, 99, -1])
-      expect(fetchChunk.mock.calls.map((c) => c[0])).toEqual([0, 1, 63])
+      source.prefetch([0, 63, 1, 99, -1])
+      // Two on the link at once; the third follows as one finishes.
+      expect(fetchChunk.mock.calls.map((c) => c[0])).toEqual([0, 63])
+      await vi.waitFor(() => expect(fetchChunk).toHaveBeenCalledTimes(3))
+      expect(fetchChunk.mock.calls[2]![0]).toBe(1)
       expect(await source.read(63 * 1024, 10)).toEqual(expected(63 * 1024, 10))
       expect(await source.read(0, 2048)).toEqual(expected(0, 2048))
       expect(fetchChunk).toHaveBeenCalledTimes(3)
     })
 
-    it('fetches the start and the last chunks together', () => {
+    it('fetches the header, then the end of the file, then the rest of the start', async () => {
       const { fetchChunk } = remoteFile(64 * 1024, 1024)
       const source = new ChunkedSource({ size: 64 * 1024, chunkSize: 1024, fetchChunk })
       source.prefetchStart(3, 2)
-      expect(fetchChunk.mock.calls.map((c) => c[0])).toEqual([0, 1, 2, 63, 62])
+      await vi.waitFor(() => expect(fetchChunk).toHaveBeenCalledTimes(5))
+      expect(fetchChunk.mock.calls.map((c) => c[0])).toEqual([0, 63, 62, 1, 2])
     })
 
     it('is not cancelled by a read elsewhere', async () => {

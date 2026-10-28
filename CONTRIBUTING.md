@@ -52,3 +52,14 @@ Release is published, through npm trusted publishing: no npm token is stored any
 3. On GitHub, open **Releases → Draft a new release**, choose the new tag (`v0.1.1`), paste the
    changelog entry and press **Publish release**. The workflow checks that the tag matches
    `package.json`, runs the full check and publishes.
+
+### Telling the projects built on it
+
+After publishing, the release workflow tells the projects built on this package that a new
+version is out, and each opens its own update: Web-Media-Player moves to it (its "Update the
+decoder" workflow) and TMPlayer-web too, as far as the newest player accepts (its "Update player
+libraries" workflow). They also look once a day or a week on their own, so this only makes it
+immediate. It needs one secret here, under **Settings → Secrets and variables → Actions**:
+`DISPATCH_TOKEN`, a fine-grained personal access token with **Contents: read and write** on
+Roshan-Here/Web-Media-Player and Roshan-Here/Tmplayer-web. Without it the step only notes that
+no one was told.

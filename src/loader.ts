@@ -26,6 +26,17 @@ export interface LoaderOptions {
   blockRemoteFonts?: boolean
 }
 
+let defaults: LoaderOptions = {}
+
+/**
+ * Sets the loader options every decoder uses when it is not given its own, once, before the
+ * first video: for example `configureLoader({ logLevel: 'silent' })` for a quiet console on a
+ * live site, or a `wasmUrl` for a CDN. Options a decoder is given still win.
+ */
+export function configureLoader(options: LoaderOptions): void {
+  defaults = { ...defaults, ...options }
+}
+
 let loading: Promise<MoviModule> | null = null
 let warming: Promise<void> | null = null
 
@@ -59,7 +70,10 @@ const LOG_LEVELS = {
  * Its constructor turns the library's logging up to debug, which floods the console and costs
  * time on every frame, so the level is set back here.
  */
-export async function createDecoderElement(options: LoaderOptions = {}): Promise<MoviElement> {
+export async function createDecoderElement(given: LoaderOptions = {}): Promise<MoviElement> {
+  const options: LoaderOptions = { ...defaults }
+  for (const [key, value] of Object.entries(given) as Array<[keyof LoaderOptions, never]>)
+    if (value !== undefined) options[key] = value
   const movi = await loadDecoder()
   const element = document.createElement('movi-player') as MoviElement
   movi.Logger.setLevel(movi.LogLevel[LOG_LEVELS[options.logLevel ?? 'warn']])

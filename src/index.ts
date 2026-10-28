@@ -9,6 +9,7 @@
  */
 export { createBuiltinDecoder, type BuiltinDecoderOptions } from './decoder.js'
 export {
+  configureLoader,
   loadDecoder,
   preloadDecoder,
   createDecoderElement,

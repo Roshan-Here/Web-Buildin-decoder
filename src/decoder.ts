@@ -360,7 +360,10 @@ export async function createBuiltinDecoder(options: BuiltinDecoderOptions): Prom
         const p = player()
         if (!p) return null
         try {
-          return await p.getPreviewFrame(Math.max(0, time))
+          // Queued behind a still the player is already making (its own warm-up, or the last
+          // one asked for) instead of being turned away with nothing: an empty answer reads as
+          // "no picture at this time", and that stretch would never get one.
+          return await p.getPreviewFrame(Math.max(0, time), null, true)
         } catch (error) {
           logDecoder('preview failed', error, 'warn')
           return null

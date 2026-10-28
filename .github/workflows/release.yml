@@ -34,3 +34,29 @@ jobs:
       - run: npm ci
       # Runs the full check (types, tests, build) through prepublishOnly, then publishes.
       - run: npm publish
+
+      # Tells the projects built on this one that a new version is out, so each opens its own
+      # update at once (their "Update" workflows also look once a day on their own). Needs a
+      # DISPATCH_TOKEN secret: a fine-grained token with "Contents: read and write" on those
+      # repositories. Without one this step only says so.
+      - name: Tell the projects built on it
+        env:
+          GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+          DEPENDENTS: Roshan-Here/Web-Media-Player:decoder-released Roshan-Here/Tmplayer-web:player-libs-released
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "No DISPATCH_TOKEN secret, so no one was told; they look on their own once a day." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          for target in $DEPENDENTS; do
+            repo="${target%%:*}"
+            event="${target#*:}"
+            if gh api "repos/$repo/dispatches" -f "event_type=$event" \
+              -f "client_payload[package]=$(node -p "require('./package.json').name")" \
+              -f "client_payload[version]=${VERSION#v}"; then
+              echo "Told $repo ($event)." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::Could not tell $repo about this release."
+            fi
+          done

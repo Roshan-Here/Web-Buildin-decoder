@@ -222,6 +222,18 @@ For a backend that serves a file in pieces, give `ChunkedSource` a way to fetch 
 it does the rest: an LRU cache, read ahead that a seek cancels, one download per chunk however
 many readers want it, and a side reader for timeline previews.
 
+Downloads are scheduled by who is waiting, since every download in flight shares one link:
+
+| First | What                                 | How                                                                                            |
+| ----- | ------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| 1     | A chunk playback is waiting for      | Starts at once; nothing else starts until it arrives                                           |
+| 2     | A chunk a timeline preview waits for | Starts at once; read ahead waits for it while playback has a couple of chunks in hand          |
+| 3     | `prefetch` / `prefetchStart`         | In the order given, `concurrency` (default 2) at a time; not cancelled by reads                |
+| 4     | Read ahead after each read           | Nearest first: one at a time while playback has nothing in hand, `concurrency` once it has one |
+
+After a seek, the chunk the picture needs gets the link to itself instead of sharing it with
+read ahead from where playback was, which is cancelled.
+
 ```ts
 import { ChunkedSource, createBuiltinDecoder } from 'web-buildin-decoder'
 
@@ -261,6 +273,7 @@ await createBuiltinDecoder({ host, source, key: id })
 | Export                                                    | What it is                                          |
 | --------------------------------------------------------- | --------------------------------------------------- |
 | `preloadDecoder(options?)`                                | Downloads and compiles the decoder ahead of time    |
+| `configureLoader(options)`                                | Defaults for every decoder (`logLevel`, `wasmUrl`)  |
 | `loadDecoder()`, `createDecoderElement(options?)`         | Lower level: the module, and a bare `<movi-player>` |
 | `httpSource`, `fileSource`, `bufferSource`                | Ready-made `ByteSource`s                            |
 | `ChunkedSource`                                           | Chunk cache with read ahead for your own backend    |
@@ -296,6 +309,18 @@ Warnings and errors go to the console with a `[decoder]` prefix. Everyday steps 
 with `configureDiagnostics({ verbose: true })` or `localStorage.debug = 'decoder'`. Send them
 to your own logging with `configureDiagnostics({ sink })`, and attach `diagnosticsReport()` to
 bug reports: it holds the browser, whether WebCodecs is there, and the last 200 steps.
+
+For a quiet console on a live site, keep the log for bug reports but print nothing, and turn
+movi-player's own logging off:
+
+```ts
+import { configureDiagnostics, configureLoader } from 'web-buildin-decoder'
+
+if (import.meta.env.PROD) {
+  configureDiagnostics({ sink: () => {} }) // still kept for diagnosticsReport()
+  configureLoader({ logLevel: 'silent' })
+}
+```
 
 ## Bundlers, hosting and security headers
 
@@ -346,7 +371,8 @@ A few things the decoder handles so you do not have to:
 - **Previews that do not stall playback.** movi-player's keyframe-only preview decoder would
   read through playback's own reader, so every hovered position would cancel the read ahead.
   Previews get their own reader over the chunk cache instead, and the preview decoder is only
-  started the first time the pointer reaches the timeline.
+  started the first time the pointer reaches the timeline. A preview asked for while another
+  is being made waits its turn rather than coming back empty.
 - **Subtitles turned on mid-line.** Subtitle packets arrive with the stream, so turning
   subtitles on re-reads from the last keyframe (the bytes are in the cache) to pick up the line
   already on screen.

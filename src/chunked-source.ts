@@ -21,18 +21,37 @@ export interface ChunkedSourceOptions {
   cacheChunks?: number
   /** Chunks downloaded ahead of the last read, so playback rarely waits. */
   readAhead?: number
-  /** Downloads running at once for read ahead; reads the element is waiting for skip the queue. */
+  /**
+   * The most downloads on the link at once for work nobody waits for yet (prefetch and read
+   * ahead). Two keep the link busy through each request's round trip; more only split the
+   * bandwidth, so the next chunk playback needs arrives later. Reads someone waits for always
+   * start at once.
+   */
   concurrency?: number
 }
+
+/** A read waiting for a chunk: playback's, or the side reader's (timeline previews). */
+type Waiter = 'playback' | 'side'
 
 /**
  * A {@link ByteSource} over a remote file that can only be fetched in fixed, aligned chunks.
  *
- * Reads are answered from an LRU cache of chunks. Every read also queues the chunks after it,
- * and a new read replaces that queue, so a seek stops the old read ahead instead of finishing
- * gigabytes nobody will watch. The read ahead already downloading is called off too, when it
- * is out of the new window: on a seek, the chunk the player now waits for has the connections
- * to itself instead of sharing them with megabytes from where it was. Concurrent requests for
+ * Reads are answered from an LRU cache of chunks. Downloads are scheduled by who needs them,
+ * because every download in flight shares one link: a 1 MiB chunk fetched beside five others
+ * takes six times as long. So:
+ *
+ * - A read someone is waiting for starts its download at once.
+ * - Work nobody waits for yet (the start of the file fetched on opening, then read ahead after
+ *   each read) runs at most [concurrency] downloads at a time, in order, nearest first, and
+ *   none of it starts while playback waits for a chunk: after a seek, the chunk the picture
+ *   needs gets the link to itself, then the read ahead follows it, one chunk at a time until
+ *   playback has one in hand.
+ * - Previews (the side reader) wait their turn the same way, but read ahead pauses for them only
+ *   while playback has some chunks in hand, so hovering the timeline never starves the video.
+ *
+ * Every read queues the chunks after it, and a new read replaces that queue, so a seek stops
+ * the old read ahead instead of finishing gigabytes nobody will watch; the read ahead already
+ * downloading is called off too when it falls outside the new window. Concurrent requests for
  * one chunk share one download, and a download something is waiting for is never called off.
  */
 export class ChunkedSource implements ByteSource {
@@ -47,8 +66,13 @@ export class ChunkedSource implements ByteSource {
   private readonly inflight = new Map<number, Promise<Uint8Array>>()
   /** Read ahead on its way that no read has asked for yet, and so may be called off. */
   private readonly ahead = new Map<number, AbortController>()
-  private queue: number[] = []
-  private running = 0
+  /** Chunks reads are waiting for, by whose reads, with how many reads waiting. */
+  private readonly waiting = new Map<number, Map<Waiter, number>>()
+  /** Asked for by prefetch: not cancelled by reads, and fetched before read ahead. */
+  private prefetchQueue: number[] = []
+  private aheadQueue: number[] = []
+  /** The chunk after playback's last read: where the chunks it has in hand are counted from. */
+  private playhead = 0
 
   constructor(options: ChunkedSourceOptions) {
     this.size = options.size
@@ -88,7 +112,7 @@ export class ChunkedSource implements ByteSource {
       const pending = this.inflight.get(index)
       if (pending) {
         this.ahead.delete(index)
-        return pending
+        return this.waitFor(index, 'side', pending)
       }
       const download = this.fetchChunk(index, this.chunkSize)
         .then((bytes) => {
@@ -102,7 +126,7 @@ export class ChunkedSource implements ByteSource {
         })
         .finally(() => this.settled(index, download))
       this.inflight.set(index, download)
-      return download
+      return this.waitFor(index, 'side', download)
     }
     return {
       size: this.size,
@@ -121,11 +145,15 @@ export class ChunkedSource implements ByteSource {
     const first = Math.floor(offset / this.chunkSize)
     const last = Math.floor((end - 1) / this.chunkSize)
 
-    if (readAhead) this.scheduleReadAhead(first, last + 1)
-
     const indices: number[] = []
     for (let i = first; i <= last; i++) indices.push(i)
-    const chunks = await Promise.all(indices.map((i) => getChunk(i)))
+    // The chunks asked for first, so the read ahead queued after them waits for them.
+    const pending = indices.map((i) => getChunk(i))
+    if (readAhead) {
+      this.playhead = last + 1
+      this.scheduleReadAhead(first, last + 1)
+    }
+    const chunks = await Promise.all(pending)
 
     const out = new Uint8Array(end - offset)
     let written = 0
@@ -145,37 +173,37 @@ export class ChunkedSource implements ByteSource {
   }
 
   /**
-   * Starts downloading these chunks now, before anyone reads them: by the time the decoder asks for the header (and,
-   * for Matroska or an MP4 with its index at the end, for the end of the file), the bytes are
-   * already here instead of each costing a round trip in turn. Unlike read ahead, a new read
-   * does not cancel these. Chunks already cached or on their way are skipped.
+   * Fetches these chunks before anyone reads them, as soon as a video is opened: by the time the decoder asks for the header (and, for Matroska
+   * or an MP4 with its index at the end, for the end of the file), the bytes are here or on
+   * their way. They are fetched in the order given, before any read ahead, a few at a time
+   * (see [concurrency]); unlike read ahead, a new read does not cancel them. Chunks already
+   * cached or on their way are skipped.
    */
   prefetch(indices: readonly number[]): void {
     for (const index of indices) {
       if (index < 0 || index >= this.chunkCount) continue
       if (this.cache.has(index) || this.inflight.has(index)) continue
-      this.getChunk(index).catch(() => {
-        // Best effort; the read that needs this chunk will retry and report.
-      })
+      if (!this.prefetchQueue.includes(index)) this.prefetchQueue.push(index)
     }
+    this.pump()
   }
 
   /**
-   * What any player reads first, fetched now: the first [headChunks] chunks (the header, and
-   * an MP4's index when it comes first) and the last [tailChunks] (where Matroska keeps its
-   * index, and many MP4s theirs). Fetched together these cost one round trip instead of
-   * several in turn.
+   * What any player reads first: the header, then the end of the file (where Matroska keeps
+   * its index, and many MP4s theirs; [tailChunks] of it), then the rest of the first
+   * [headChunks] chunks, where playback from the start begins.
    */
   prefetchStart(headChunks = 4, tailChunks = 1): void {
     const head = Array.from({ length: Math.max(0, headChunks) }, (_, i) => i)
     const tail = Array.from({ length: Math.max(0, tailChunks) }, (_, i) => this.chunkCount - 1 - i)
-    this.prefetch([...head, ...tail])
+    this.prefetch([...head.slice(0, 1), ...tail, ...head.slice(1)])
   }
 
-  /** Forgets cached chunks and pending read ahead, and calls off the read ahead on its way. */
+  /** Forgets cached chunks and queued work, and calls off the read ahead on its way. */
   clear(): void {
     this.cache.clear()
-    this.queue = []
+    this.aheadQueue = []
+    this.prefetchQueue = []
     for (const index of [...this.ahead.keys()]) this.cancelAhead(index)
   }
 
@@ -195,13 +223,32 @@ export class ChunkedSource implements ByteSource {
     // A read ahead that a read now waits for is no longer anyone's to call off.
     if (pending) {
       this.ahead.delete(index)
-      return pending.then((bytes) => {
-        if (!this.cache.has(index)) this.remember(index, bytes)
-        return bytes
-      })
+      return this.waitFor(
+        index,
+        'playback',
+        pending.then((bytes) => {
+          if (!this.cache.has(index)) this.remember(index, bytes)
+          return bytes
+        }),
+      )
     }
+    this.prefetchQueue = this.prefetchQueue.filter((i) => i !== index)
+    return this.waitFor(index, 'playback', this.download(index))
+  }
 
-    return this.download(index)
+  /** Counts a read as waiting for [index] until [promise] settles, for the scheduling. */
+  private waitFor(index: number, who: Waiter, promise: Promise<Uint8Array>): Promise<Uint8Array> {
+    const counts = this.waiting.get(index) ?? new Map<Waiter, number>()
+    counts.set(who, (counts.get(who) ?? 0) + 1)
+    this.waiting.set(index, counts)
+    const done = () => {
+      const n = (counts.get(who) ?? 1) - 1
+      if (n > 0) counts.set(who, n)
+      else counts.delete(who)
+      if (counts.size === 0 && this.waiting.get(index) === counts) this.waiting.delete(index)
+      this.pump()
+    }
+    return promise.finally(done)
   }
 
   /** A download into the cache; [signal] can call it off (for read ahead). */
@@ -212,7 +259,10 @@ export class ChunkedSource implements ByteSource {
         this.remember(index, bytes)
         return bytes
       })
-      .finally(() => this.settled(index, download))
+      .finally(() => {
+        this.settled(index, download)
+        this.pump()
+      })
     this.inflight.set(index, download)
     return download
   }
@@ -243,7 +293,7 @@ export class ChunkedSource implements ByteSource {
   /** Read ahead for a read of chunks [first] to [from] - 1: the next [readAhead] chunks. */
   private scheduleReadAhead(first: number, from: number): void {
     const end = Math.min(from + this.readAhead, this.chunkCount)
-    // A seek: what was on its way for the old position is called off, freeing the connections.
+    // A seek: what was on its way for the old position is called off, freeing the link.
     for (const index of [...this.ahead.keys()]) {
       if (index < first || index >= end) this.cancelAhead(index)
     }
@@ -251,15 +301,44 @@ export class ChunkedSource implements ByteSource {
     for (let i = from; i < end; i++) {
       if (!this.cache.has(i) && !this.inflight.has(i)) next.push(i)
     }
-    this.queue = next
+    this.aheadQueue = next
     this.pump()
   }
 
+  /** Chunks playback has in hand past its last read, without a gap. */
+  private inHand(): number {
+    let n = 0
+    while (this.cache.has(this.playhead + n)) n++
+    return n
+  }
+
+  /** Whether work nobody waits for has to give the link to a read that is waiting. */
+  private yieldToReads(): boolean {
+    let side = false
+    for (const counts of this.waiting.values()) {
+      if (counts.has('playback')) return true
+      if (counts.has('side')) side = true
+    }
+    // Previews go first only while playback has something to play meanwhile.
+    return side && this.inHand() >= 2
+  }
+
   private pump(): void {
-    while (this.running < this.concurrency && this.queue.length > 0) {
-      const index = this.queue.shift()!
+    while (!this.yieldToReads()) {
+      const fromPrefetch = this.prefetchQueue.length > 0
+      // Read ahead with nothing in hand fetches strictly one chunk at a time, so the next one
+      // playback needs is not slowed by the one after it; with a chunk in hand, two overlap.
+      const limit = fromPrefetch || this.inHand() >= 1 ? this.concurrency : 1
+      if (this.inflight.size >= limit) return
+      const index = fromPrefetch ? this.prefetchQueue.shift() : this.aheadQueue.shift()
+      if (index === undefined) return
       if (this.cache.has(index) || this.inflight.has(index)) continue
-      this.running++
+      if (fromPrefetch) {
+        this.download(index).catch(() => {
+          // Best effort; the read that needs this chunk will retry and report.
+        })
+        continue
+      }
       const controller = new AbortController()
       this.ahead.set(index, controller)
       this.download(index, controller.signal)
@@ -269,8 +348,6 @@ export class ChunkedSource implements ByteSource {
         })
         .finally(() => {
           if (this.ahead.get(index) === controller) this.ahead.delete(index)
-          this.running--
-          this.pump()
         })
     }
   }

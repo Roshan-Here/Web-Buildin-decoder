@@ -3,6 +3,10 @@ import { describeCodec, languageName, sameLanguage } from '../src/languages.js'
 import { defaultMessages, resolveMessages } from '../src/messages.js'
 
 describe('languageName', () => {
+  it('names the language in English when the locale is a tag Intl refuses', () => {
+    expect(languageName('es', 'en-US@posix')).toBe('Spanish')
+  })
+
   it('names three- and two-letter codes in the locale asked for', () => {
     expect(languageName('eng', 'en')).toBe('English')
     expect(languageName('en', 'en')).toBe('English')

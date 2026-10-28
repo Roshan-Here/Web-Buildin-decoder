@@ -9,10 +9,15 @@ const languageNamers = new Map<string, Intl.DisplayNames | null>()
 function languageNames(locale: string): Intl.DisplayNames | null {
   let namer = languageNamers.get(locale)
   if (namer === undefined) {
+    // A tag Intl refuses ("en-US@posix", from some system locales) falls back to English.
     try {
       namer = new Intl.DisplayNames([locale, 'en'], { type: 'language' })
     } catch {
-      namer = null
+      try {
+        namer = new Intl.DisplayNames(['en'], { type: 'language' })
+      } catch {
+        namer = null
+      }
     }
     languageNamers.set(locale, namer)
   }
