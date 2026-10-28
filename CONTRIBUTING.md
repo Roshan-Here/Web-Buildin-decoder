@@ -37,21 +37,31 @@ ideal), and the text of `diagnosticsReport()` from the page where it failed.
 
 ## Releasing
 
-Releases are published to npm by GitHub Actions (`.github/workflows/release.yml`) when a GitHub
-Release is published, through npm trusted publishing: no npm token is stored anywhere.
+Releasing is a version bump pushed to `master`; GitHub Actions does the rest. When CI passes on
+a push and `package.json` holds a version that is not on npm yet, `.github/workflows/release.yml`
+publishes it (npm trusted publishing: no npm token is stored anywhere, and npm adds a provenance
+statement), tags the commit `v<version>`, and makes the GitHub Release from that version's
+`CHANGELOG.md` entry. A push that leaves the version alone publishes nothing.
 
-1. Add the changes under a new version heading in `CHANGELOG.md`.
-2. Bump the version, which commits and tags it (`patch` for fixes, `minor` for new features,
-   `major` for breaking changes), and push:
+1. Add the changes under a new version heading in `CHANGELOG.md` (`## [0.2.1] - date`, and its
+   link at the bottom).
+2. Bump the version without a local tag (the workflow makes the tag; `patch` for fixes,
+   `minor` for new features, `major` for breaking changes), commit and push:
 
    ```sh
-   npm version patch
-   git push --follow-tags
+   npm version patch --no-git-tag-version
+   git commit -am "Release 0.2.1"
+   git push
    ```
 
-3. On GitHub, open **Releases → Draft a new release**, choose the new tag (`v0.1.1`), paste the
-   changelog entry and press **Publish release**. The workflow checks that the tag matches
-   `package.json`, runs the full check and publishes.
+3. Watch **Actions**: CI runs, then Release publishes. To retry a failed release, open
+   **Actions → Release → Run workflow**.
+
+Don't publish from your own computer: the version would be on npm without its tag, GitHub
+Release or the message to the projects built on it, and the workflow would then skip it.
+
+One-time setup on npmjs.com, already done: the package's **Settings → Trusted publishing**
+names this repository and the workflow file `release.yml`.
 
 ### Telling the projects built on it
 

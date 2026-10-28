@@ -1,60 +1,136 @@
 name: Release
 
-# Publishes to npm when a GitHub Release is published. No npm token is stored: npm trusts this
-# workflow through trusted publishing (OIDC), set up once in the package's settings on npmjs.com,
-# and adds a provenance statement linking each version to the commit it was built from.
+# Publishes by itself. When CI passes on a push to master and package.json holds a version that
+# is not on npm yet, this publishes it to npm, tags the commit, makes the GitHub Release from the
+# version's CHANGELOG entry, and tells the projects built on this one. A push that leaves the
+# version alone publishes nothing, so releasing is: bump the version, push.
+#
+# npm trusts this workflow through trusted publishing (OIDC), set up once in the package's
+# settings on npmjs.com for this file, release.yml: no npm token is stored anywhere, and npm adds
+# a provenance statement linking each version to the commit it was built from. "Run workflow" on
+# the Actions tab does the same for master's latest commit (to retry a failed release, say).
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master, main]
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  # The tag and the GitHub Release.
+  contents: write
   # Lets GitHub prove to npm that this workflow, in this repository, is publishing.
   id-token: write
 
+# One release at a time; a second push while one publishes waits its turn.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   publish:
+    name: Publish a new version
+    # A push whose CI passed, never a pull request's run, or a run started by hand.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The very commit CI tested.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      # Trusted publishing needs npm 11.5.1 or later.
-      - run: npm install -g npm@latest
-      - name: Check the release tag matches package.json
+
+      - name: Is this version new?
+        id: version
         run: |
+          name="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
-          tag="${GITHUB_REF_NAME#v}"
-          if [ "$tag" != "$version" ]; then
-            echo "::error::The release tag ($GITHUB_REF_NAME) does not match package.json ($version). Run npm version first."
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if npm view "$name@$version" version > /dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "$name $version is on npm already, so there is nothing to release. Bump the version in package.json to release." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check the tag is free
+        if: steps.version.outputs.new == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          here="$(git rev-parse HEAD)"
+          # The commit the tag marks on GitHub, if there is one (an annotated tag's peeled line, ^{}, sorts last).
+          there="$(git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | awk '{print $1}' | tail -1)"
+          if [ -n "$there" ] && [ "$there" != "$here" ]; then
+            echo "::error::The tag $TAG already marks another commit (${there:0:7}). Bump the version in package.json, or delete that tag, then push again."
             exit 1
           fi
-      - run: npm ci
+
+      # Trusted publishing needs npm 11.5.1 or later.
+      - if: steps.version.outputs.new == 'true'
+        run: npm install -g npm@11
+      - if: steps.version.outputs.new == 'true'
+        run: npm ci
       # Runs the full check (types, tests, build) through prepublishOnly, then publishes.
-      - run: npm publish
+      - name: Publish to npm
+        if: steps.version.outputs.new == 'true'
+        run: npm publish
+
+      - name: Tag it and make the GitHub Release
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          NAME: ${{ steps.version.outputs.name }}
+        run: |
+          # The version's own entry in CHANGELOG.md, without its heading.
+          awk -v head="## [$VERSION]" '
+            index($0, head) == 1 { on = 1; next }
+            on && (/^## \[/ || /^\[[^]]+\]: /) { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+          echo "" >> notes.md
+          echo "npm: https://www.npmjs.com/package/$NAME/v/$VERSION" >> notes.md
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "The GitHub Release $TAG is there already."
+          else
+            gh release create "$TAG" --target "$(git rev-parse HEAD)" --title "$TAG" --notes-file notes.md
+          fi
+          echo "Published $NAME $VERSION and made the release $TAG." >> "$GITHUB_STEP_SUMMARY"
 
       # Tells the projects built on this one that a new version is out, so each opens its own
-      # update at once (their "Update" workflows also look once a day on their own). Needs a
-      # DISPATCH_TOKEN secret: a fine-grained token with "Contents: read and write" on those
-      # repositories. Without one this step only says so.
+      # update at once (their "Update" workflows also look on their own every day or week).
+      # Needs a DISPATCH_TOKEN secret: a fine-grained token with "Contents: read and write" on
+      # those repositories. Without one this step only says so.
       - name: Tell the projects built on it
+        if: steps.version.outputs.new == 'true'
         env:
           GH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
-          VERSION: ${{ github.ref_name }}
+          NAME: ${{ steps.version.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
           DEPENDENTS: Roshan-Here/Web-Media-Player:decoder-released Roshan-Here/Tmplayer-web:player-libs-released
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "No DISPATCH_TOKEN secret, so no one was told; they look on their own once a day." >> "$GITHUB_STEP_SUMMARY"
+            echo "No DISPATCH_TOKEN secret, so no one was told; they look on their own." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           for target in $DEPENDENTS; do
             repo="${target%%:*}"
             event="${target#*:}"
             if gh api "repos/$repo/dispatches" -f "event_type=$event" \
-              -f "client_payload[package]=$(node -p "require('./package.json').name")" \
-              -f "client_payload[version]=${VERSION#v}"; then
+              -f "client_payload[package]=$NAME" -f "client_payload[version]=$VERSION"; then
               echo "Told $repo ($event)." >> "$GITHUB_STEP_SUMMARY"
             else
               echo "::warning::Could not tell $repo about this release."
