@@ -18,8 +18,8 @@ export interface ChunkedSourceOptions {
    */
   chunkSize?: number
   /**
-   * Chunks kept in memory, most recently used first. Left out, it is the read ahead and a little
-   * behind it (see `fitReadAhead`), at least 32.
+   * Chunks kept in memory: those nearest where playback is are the last to go. Left out, it
+   * holds the read ahead and what is kept behind and away (see `fitReadAhead`), at least 32.
    */
   cacheChunks?: number
   /**
@@ -28,6 +28,24 @@ export interface ChunkedSourceOptions {
    * decoder calls `fitReadAhead` when it opens the file); given, it stays as given.
    */
   readAhead?: number
+  /**
+   * Chunks behind the last read kept in memory before any ahead of it go, so a skip back to
+   * what was just played is answered at once instead of downloaded again. Left out, none until
+   * `fitReadAhead` makes it a minute of the video; given, it stays as given.
+   */
+  keepBehind?: number
+  /**
+   * Chunks before the last read downloaded once the read ahead is done, when they are not here
+   * (after a seek, or opening part way in), so a skip back from there is instant too. At most
+   * [keepBehind]. Left out, none until `fitReadAhead` makes it half a minute.
+   */
+  readBehind?: number
+  /**
+   * Chunks kept from where playback was before a jump elsewhere in the file (back to the
+   * start, far along the timeline), before anything else farther off, so going back there is
+   * instant. Left out, none until `fitReadAhead` makes it a minute.
+   */
+  keepAway?: number
   /**
    * The most downloads on the link at once for work nobody waits for yet (prefetch and read
    * ahead). Two keep the link busy through each request's round trip; more only split the
@@ -43,7 +61,10 @@ type Waiter = 'playback' | 'side'
 /**
  * A {@link ByteSource} over a remote file that can only be fetched in fixed, aligned chunks.
  *
- * Reads are answered from an LRU cache of chunks. Downloads are scheduled by who needs them,
+ * Reads are answered from a cache of chunks that keeps what is nearest where playback is: the
+ * read ahead, [keepBehind] chunks behind it (what was just played), [keepAway] from where
+ * playback was before a jump, and the start and end of the file; the farthest go first, so a
+ * skip back is as quick as one forward. Downloads are scheduled by who needs them,
  * because every download in flight shares one link: a 1 MiB chunk fetched beside five others
  * takes six times as long. So:
  *
@@ -67,9 +88,17 @@ export class ChunkedSource implements ByteSource {
   private readonly fetchChunk: ChunkedSourceOptions['fetchChunk']
   private cacheChunks: number
   private readAhead: number
-  /** Whether the read ahead (and the cache) follow the video's length, or stay as given. */
-  private readonly fitsAhead: boolean
-  private readonly fitsCache: boolean
+  private keepBehind: number
+  private readBehind: number
+  private keepAway: number
+  /** Which sizes follow the video's length, rather than stay as given. */
+  private readonly fits: {
+    ahead: boolean
+    cache: boolean
+    keepBehind: boolean
+    readBehind: boolean
+    keepAway: boolean
+  }
   private readonly concurrency: number
 
   private readonly cache = new Map<number, Uint8Array>()
@@ -83,6 +112,12 @@ export class ChunkedSource implements ByteSource {
   private aheadQueue: number[] = []
   /** The chunk after playback's last read: where the chunks it has in hand are counted from. */
   private playhead = 0
+  /** The first chunk of playback's last read: what the cache keeps nearest. */
+  private at = 0
+  /** Where the read ahead reached before the last read: kept too after a small skip back. */
+  private reached = 0
+  /** Where playback was before its last jump out of what is kept, while that is kept. */
+  private previous: number | null = null
 
   constructor(options: ChunkedSourceOptions) {
     this.size = options.size
@@ -90,8 +125,16 @@ export class ChunkedSource implements ByteSource {
     this.chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE
     this.cacheChunks = Math.max(2, options.cacheChunks ?? 32)
     this.readAhead = Math.max(0, options.readAhead ?? 4)
-    this.fitsAhead = options.readAhead === undefined
-    this.fitsCache = options.cacheChunks === undefined
+    this.keepBehind = Math.max(0, options.keepBehind ?? 0)
+    this.readBehind = Math.max(0, options.readBehind ?? 0)
+    this.keepAway = Math.max(0, options.keepAway ?? 0)
+    this.fits = {
+      ahead: options.readAhead === undefined,
+      cache: options.cacheChunks === undefined,
+      keepBehind: options.keepBehind === undefined,
+      readBehind: options.readBehind === undefined,
+      keepAway: options.keepAway === undefined,
+    }
     this.concurrency = Math.max(1, options.concurrency ?? 2)
   }
 
@@ -212,19 +255,33 @@ export class ChunkedSource implements ByteSource {
   }
 
   /**
-   * Sizes the read ahead by time once the video's length is known: about [seconds] (90) of it at
-   * its average bitrate, as streaming apps keep in hand, so a skip forward of ten or thirty
-   * seconds lands on bytes already here and a weak patch of signal is ridden out; as much as the
-   * device's memory allows (`aheadCap`). The cache grows to hold it and a little behind it, so a
-   * skip back is instant too. Does nothing when `readAhead` (or `cacheChunks`) was given.
+   * Sizes what is kept by time once the video's length is known, as streaming apps keep it, as
+   * far as the device's memory allows (`aheadCap`):
+   *
+   * - about [seconds] (90) read ahead, so a skip forward of ten or thirty seconds lands on bytes
+   *   already here and a weak patch of signal is ridden out;
+   * - [behindSeconds] (60) of what was just played kept, and [readBehindSeconds] (30) before
+   *   where playback started fetched once the read ahead is done, so a skip back is as quick;
+   * - [awaySeconds] (60) kept from where playback was before a jump, so going back is instant.
+   *
+   * Behind and away each take at most half of what is kept ahead. The cache grows to hold it
+   * all. Sizes given to the constructor stay as given.
    */
   fitReadAhead(durationSeconds: number, options: FitReadAheadOptions = {}): void {
-    if (!this.fitsAhead) return
-    this.readAhead = readAheadChunks(this.size, durationSeconds, {
-      chunkSize: this.chunkSize,
-      ...options,
-    })
-    if (this.fitsCache) this.cacheChunks = Math.max(32, this.readAhead + KEPT_BEHIND)
+    const sized = { chunkSize: this.chunkSize, ...options }
+    const half = Math.ceil((options.maxMiB ?? aheadCap()) / 2)
+    const behind = (seconds: number) =>
+      behindChunks(this.size, durationSeconds, { ...sized, seconds, maxMiB: half })
+    if (this.fits.ahead) this.readAhead = readAheadChunks(this.size, durationSeconds, sized)
+    if (this.fits.keepBehind) this.keepBehind = behind(options.behindSeconds ?? BEHIND_SECONDS)
+    if (this.fits.readBehind)
+      this.readBehind = behind(options.readBehindSeconds ?? READ_BEHIND_SECONDS)
+    if (this.fits.keepAway) this.keepAway = behind(options.awaySeconds ?? AWAY_SECONDS)
+    if (this.fits.cache)
+      this.cacheChunks = Math.max(
+        32,
+        this.readAhead + this.keepBehind + this.keepAway + SPARE_CHUNKS,
+      )
   }
 
   /** How many chunks are read ahead of playback now. */
@@ -237,6 +294,22 @@ export class ChunkedSource implements ByteSource {
     let index = Math.floor(Math.max(0, offset) / this.chunkSize)
     while (index < this.chunkCount && this.cache.has(index)) index++
     return Math.max(offset, Math.min(this.size, index * this.chunkSize))
+  }
+
+  /**
+   * Every stretch of the file downloaded, as [start, end) byte ranges in order: what is ahead
+   * of the playhead, what was just played, and what is kept from where playback was before.
+   */
+  bufferedRuns(): Array<[number, number]> {
+    const runs: Array<[number, number]> = []
+    for (const index of [...this.cache.keys()].sort((a, b) => a - b)) {
+      const start = index * this.chunkSize
+      const end = Math.min(this.size, start + this.chunkSize)
+      const last = runs[runs.length - 1]
+      if (last && last[1] === start) last[1] = end
+      else runs.push([start, end])
+    }
+    return runs
   }
 
   /** Forgets cached chunks and queued work, and calls off the read ahead on its way. */
@@ -324,21 +397,76 @@ export class ChunkedSource implements ByteSource {
   private remember(index: number, bytes: Uint8Array): void {
     this.cache.set(index, bytes)
     while (this.cache.size > this.cacheChunks) {
-      const oldest = this.cache.keys().next().value
-      if (oldest === undefined) break
-      this.cache.delete(oldest)
+      const victim = this.farthest(index)
+      if (victim === undefined) break
+      this.cache.delete(victim)
     }
   }
 
-  /** Read ahead for a read of chunks [first] to [from] - 1: the next [readAhead] chunks. */
+  /**
+   * The cached chunk to let go of first: the one farthest outside what is kept around the
+   * playhead (from [keepBehind] chunks behind it to the end of the read ahead, or as far as it
+   * had reached before a small skip back), then what is kept from where playback was before a
+   * jump; with everything kept, the one farthest behind. The first and last chunks of the file
+   * (the header, and the index Matroska and many MP4s keep at the end, which a decoder reads
+   * again when it opens the file again) go only when nothing else can, and [keep], the chunk
+   * just stored, never unless it is the only one.
+   */
+  private farthest(keep: number): number | undefined {
+    const low = this.at - this.keepBehind
+    const high = Math.max(this.at + this.readAhead, this.reached)
+    const away = this.previous
+    const awayLow = away === null ? 0 : away - Math.min(4, this.keepAway)
+    const awayHigh = away === null ? -1 : away + this.keepAway
+    const last = this.chunkCount - 1
+    let victim: number | undefined
+    let worst = Number.NEGATIVE_INFINITY
+    for (const index of this.cache.keys()) {
+      if (index === keep || index === 0 || index === last) continue
+      const distance =
+        index >= low && index <= high
+          ? -(index - low) / (high - low + 1) - 1
+          : index >= awayLow && index <= awayHigh
+            ? -(index - awayLow) / (awayHigh - awayLow + 1) / 2
+            : index < low
+              ? low - index + 0.5
+              : index - high
+      if (distance > worst) {
+        worst = distance
+        victim = index
+      }
+    }
+    if (victim !== undefined) return victim
+    for (const index of [0, last]) if (index !== keep && this.cache.has(index)) return index
+    return this.cache.size > 0 ? keep : undefined
+  }
+
+  /**
+   * Read ahead for a read of chunks [first] to [from] - 1: the next [readAhead] chunks, then the
+   * [readBehind] before [first] that are not here, nearest first.
+   */
   private scheduleReadAhead(first: number, from: number): void {
+    const was = this.at
     const end = Math.min(from + this.readAhead, this.chunkCount)
+    // A jump out of what is kept (not playing on, nor a skip within it): where playback was is
+    // kept, with what was downloaded there.
+    const jumped =
+      first < was - this.keepBehind || first > Math.max(was + this.readAhead, this.reached)
+    if (jumped && this.keepAway > 0) this.previous = was
+    // A small skip back keeps what the read ahead had reached, and lets it finish.
+    this.reached = jumped || first > was ? end : Math.max(end, this.reached)
+    this.at = first
+    // Never fetched behind farther than is kept there.
+    const start = Math.max(0, first - Math.min(this.readBehind, this.keepBehind))
     // A seek: what was on its way for the old position is called off, freeing the link.
     for (const index of [...this.ahead.keys()]) {
-      if (index < first || index >= end) this.cancelAhead(index)
+      if (index < start || index >= this.reached) this.cancelAhead(index)
     }
     const next: number[] = []
     for (let i = from; i < end; i++) {
+      if (!this.cache.has(i) && !this.inflight.has(i)) next.push(i)
+    }
+    for (let i = first - 1; i >= start; i--) {
       if (!this.cache.has(i) && !this.inflight.has(i)) next.push(i)
     }
     this.aheadQueue = next
@@ -393,9 +521,14 @@ export class ChunkedSource implements ByteSource {
   }
 }
 
-/** Chunks kept behind the playhead on top of the read ahead (fitted sizes), for skips back. */
-const KEPT_BEHIND = 24
 const AHEAD_SECONDS = 90
+/** Fitted sizes behind the playhead and away from it, in seconds of the video. */
+const BEHIND_SECONDS = 60
+const READ_BEHIND_SECONDS = 30
+const AWAY_SECONDS = 60
+const BEHIND_MIN = 12
+/** Room for the start and the end of the file, fetched on opening, and a read in flight. */
+const SPARE_CHUNKS = 8
 /** For a file whose length is not known, in 1 MiB chunks. */
 const AHEAD_UNKNOWN = 24
 const AHEAD_MIN = 12
@@ -407,6 +540,12 @@ const MiB = 1024 * 1024
 export interface FitReadAheadOptions {
   /** Seconds of the video to keep downloaded ahead; 90 by default. */
   seconds?: number
+  /** Seconds of what was just played to keep; 60 by default. */
+  behindSeconds?: number
+  /** Seconds before where playback started to fetch; 30 by default. */
+  readBehindSeconds?: number
+  /** Seconds kept from where playback was before a jump; 60 by default. */
+  awaySeconds?: number
   /** The most read ahead, in MiB; by default what the device can hold (`aheadCap`). */
   maxMiB?: number
 }
@@ -447,4 +586,25 @@ export function readAheadChunks(
   if (!(durationSeconds > 0) || !(size > 0)) return Math.min(cap, toChunks(AHEAD_UNKNOWN))
   const wanted = Math.ceil(((size / durationSeconds) * seconds) / chunkSize)
   return Math.min(cap, Math.max(toChunks(AHEAD_MIN), wanted))
+}
+
+/**
+ * How many chunks to keep (or fetch) behind the playhead, or away from it: [seconds] of the
+ * video at its average bitrate, at least 12 MiB and at most [maxMiB] (by default half of what
+ * the device keeps ahead).
+ */
+export function behindChunks(
+  size: number,
+  durationSeconds: number,
+  {
+    seconds = BEHIND_SECONDS,
+    maxMiB = Math.ceil(aheadCap() / 2),
+    chunkSize = DEFAULT_CHUNK_SIZE,
+  }: { seconds?: number; maxMiB?: number; chunkSize?: number } = {},
+): number {
+  const toChunks = (mib: number) => Math.max(1, Math.ceil((mib * MiB) / chunkSize))
+  const cap = toChunks(maxMiB)
+  if (!(durationSeconds > 0) || !(size > 0)) return Math.min(cap, toChunks(AHEAD_UNKNOWN))
+  const wanted = Math.ceil(((size / durationSeconds) * seconds) / chunkSize)
+  return Math.min(cap, Math.max(toChunks(BEHIND_MIN), wanted))
 }

@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-11-04
+
+### Added
+
+- `ChunkedSource` keeps what is behind the playhead, as it keeps what is ahead: `keepBehind`
+  chunks of what was just played (fitted: a minute), `readBehind` before where playback
+  started fetched once the read ahead is done (fitted: half a minute), and `keepAway` from
+  where playback was before a jump elsewhere in the file (fitted: a minute). Behind and away
+  each take at most half of what is kept ahead (20 MiB on a phone, up to 64 on a computer).
+  `httpSource` takes the same options.
+- `ChunkedSource.bufferedRuns()` and the optional `ByteSource.bufferedRuns()`: every stretch
+  downloaded. The built-in decoder reports each of them through `media.buffered`, so a
+  timeline shows what is kept from where playback was, too.
+- `behindChunks()`, `withRanges()` and `otherRuns()`.
+
+### Changed
+
+- When memory fills, a `ChunkedSource` lets go of the chunks farthest from playback (from what
+  is kept around it, then from where it was before a jump) instead of the least recently used,
+  and keeps the first and last chunks of the file (the header and the index a decoder reads
+  again) until nothing else can go. A skip back to what was just played is no longer
+  downloaded again.
+- After a small skip back, the read ahead already downloaded (and on its way) beyond the new
+  window is kept and finishes, instead of being dropped and called off.
+- With no `cacheChunks`, the fitted cache holds the read ahead, what is kept behind and away,
+  and 8 spare chunks.
+
 ## [0.3.0] - 2026-11-04
 
 ### Added
@@ -76,6 +103,7 @@ First release.
 - Replaceable English text (`messages`), language names in any locale, and an in-memory
   diagnostics log with `diagnosticsReport()`.
 
+[0.3.1]: https://github.com/Roshan-Here/Web-Buildin-decoder/releases/tag/v0.3.1
 [0.3.0]: https://github.com/Roshan-Here/Web-Buildin-decoder/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Roshan-Here/Web-Buildin-decoder/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Roshan-Here/Web-Buildin-decoder/releases/tag/v0.1.0

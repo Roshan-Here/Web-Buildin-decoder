@@ -197,7 +197,14 @@ export async function createBuiltinDecoder(options: BuiltinDecoderOptions): Prom
   if (source.bufferedEnd) {
     reportLoaded(element, (time, duration) => {
       const from = playheadBytes(time, duration, source.size, adapter.getPosition())
-      return from === null ? null : { from, end: source.bufferedEnd!(from), size: source.size }
+      return from === null
+        ? null
+        : {
+            from,
+            end: source.bufferedEnd!(from),
+            size: source.size,
+            runs: source.bufferedRuns?.(),
+          }
     })
   }
 

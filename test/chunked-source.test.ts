@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
-import { ChunkedSource, aheadCap, readAheadChunks } from '../src/chunked-source.js'
+import { ChunkedSource, aheadCap, behindChunks, readAheadChunks } from '../src/chunked-source.js'
+
+const MiB = 1024 * 1024
 
 /** A fake remote file whose byte at offset n is n % 251. */
 function remoteFile(size: number, chunkSize: number) {
@@ -173,20 +175,157 @@ describe('ChunkedSource', () => {
     })
   })
 
-  it('evicts the least recently used chunks', async () => {
+  it('lets go of the chunks farthest from playback first, and keeps the ends of the file', async () => {
     const { fetchChunk } = remoteFile(10_000, 1024)
     const source = new ChunkedSource({
       size: 10_000,
       chunkSize: 1024,
       fetchChunk,
       readAhead: 0,
-      cacheChunks: 2,
+      cacheChunks: 3,
     })
     await source.read(0, 1)
-    await source.read(1024, 1)
-    await source.read(2048, 1)
+    await source.read(3 * 1024, 1)
+    await source.read(4 * 1024, 1)
+    await source.read(5 * 1024, 1)
+    // Chunk 3 was farthest behind; the header (chunk 0) stays.
+    await source.read(3 * 1024, 1)
     await source.read(0, 1)
-    expect(fetchChunk.mock.calls.map((c) => c[0])).toEqual([0, 1, 2, 0])
+    expect(fetchChunk.mock.calls.map((c) => c[0])).toEqual([0, 3, 4, 5, 3])
+  })
+
+  describe('behind the playhead', () => {
+    it('keeps what was just played over what is far away, so a skip back is not downloaded again', async () => {
+      const { fetchChunk } = remoteFile(100 * 1024, 1024)
+      const source = new ChunkedSource({
+        size: 100 * 1024,
+        chunkSize: 1024,
+        fetchChunk,
+        readAhead: 2,
+        keepBehind: 4,
+        cacheChunks: 8,
+      })
+      // The tail, fetched on opening, then playback from chunk 10 on.
+      source.prefetch([99])
+      await vi.waitFor(() => expect(source.bufferedEnd(99 * 1024)).toBe(100 * 1024))
+      for (let i = 10; i <= 16; i++) await source.read(i * 1024, 1024)
+      await vi.waitFor(() => expect(source.bufferedEnd(16 * 1024)).toBe(19 * 1024))
+      fetchChunk.mockClear()
+      // Back three chunks: still here.
+      await source.read(13 * 1024, 1024)
+      expect(fetchChunk.mock.calls.map((c) => c[0])).not.toContain(13)
+      // What went to make room was the oldest of the played; the end of the file (its index)
+      // stays.
+      expect(source.bufferedEnd(10 * 1024)).toBe(10 * 1024)
+      expect(source.bufferedEnd(99 * 1024)).toBe(100 * 1024)
+    })
+
+    it('downloads the chunks just before a seek once the read ahead is under way', async () => {
+      const { fetchChunk } = remoteFile(100 * 1024, 1024)
+      const source = new ChunkedSource({
+        size: 100 * 1024,
+        chunkSize: 1024,
+        fetchChunk,
+        readAhead: 2,
+        keepBehind: 6,
+        readBehind: 3,
+        concurrency: 1,
+      })
+      await source.read(50 * 1024, 10)
+      await vi.waitFor(() => expect(fetchChunk).toHaveBeenCalledTimes(6))
+      // The chunk read and the read ahead first, then behind it, nearest first.
+      const order = fetchChunk.mock.calls.map((c) => c[0])
+      expect(order.slice(0, 3).sort()).toEqual([50, 51, 52])
+      expect(order.slice(3)).toEqual([49, 48, 47])
+      fetchChunk.mockClear()
+      // A skip back there is answered from the cache (and reads behind it in turn).
+      await source.read(47 * 1024, 10)
+      expect(fetchChunk.mock.calls.map((c) => c[0])).not.toContain(47)
+    })
+
+    it('keeps all that was read ahead after a small skip back, and lets it finish', async () => {
+      const gates: Array<() => void> = []
+      const fetchChunk = vi.fn(
+        (index: number) =>
+          new Promise<Uint8Array>((resolve) => {
+            if (index >= 60) gates.push(() => resolve(new Uint8Array(1024)))
+            else resolve(new Uint8Array(1024))
+          }),
+      )
+      const source = new ChunkedSource({
+        size: 100 * 1024,
+        chunkSize: 1024,
+        fetchChunk,
+        readAhead: 10,
+        keepBehind: 10,
+        cacheChunks: 40,
+        concurrency: 20,
+      })
+      await source.read(52 * 1024, 10)
+      // 53 to 59 arrive; 60 to 62 are still on their way.
+      await vi.waitFor(() => expect(source.bufferedEnd(52 * 1024)).toBe(60 * 1024))
+      await source.read(48 * 1024, 10)
+      // Back four chunks: the read ahead to 62 is not called off, and arrives.
+      for (const open of gates) open()
+      await vi.waitFor(() => expect(source.bufferedEnd(48 * 1024)).toBe(63 * 1024))
+    })
+
+    it('keeps where playback was before a jump, so going back there is instant', async () => {
+      const { fetchChunk } = remoteFile(200 * 1024, 1024)
+      const make = (keepAway: number) =>
+        new ChunkedSource({
+          size: 200 * 1024,
+          chunkSize: 1024,
+          fetchChunk,
+          readAhead: 8,
+          keepBehind: 4,
+          keepAway,
+          cacheChunks: 14 + keepAway,
+        })
+      for (const keepAway of [0, 10]) {
+        const source = make(keepAway)
+        // Playing at chunk 120, its read ahead to 128 in hand.
+        for (let i = 116; i <= 120; i++) await source.read(i * 1024, 1024)
+        await vi.waitFor(() => expect(source.bufferedEnd(120 * 1024)).toBe(129 * 1024))
+        // A jump back to the start, which plays a while.
+        for (let i = 5; i <= 12; i++) await source.read(i * 1024, 1024)
+        await vi.waitFor(() => expect(source.bufferedEnd(12 * 1024)).toBe(21 * 1024))
+        const kept = source.bufferedEnd(120 * 1024) - 120 * 1024
+        if (keepAway === 0) expect(kept).toBe(0)
+        else expect(kept).toBeGreaterThanOrEqual(8 * 1024)
+      }
+    })
+
+    it('lists every stretch in hand', async () => {
+      const { fetchChunk } = remoteFile(100 * 1024, 1024)
+      const source = new ChunkedSource({
+        size: 100 * 1024,
+        chunkSize: 1024,
+        fetchChunk,
+        readAhead: 1,
+      })
+      await source.read(10 * 1024, 10)
+      await source.read(50 * 1024, 10)
+      await vi.waitFor(() => expect(source.bufferedEnd(50 * 1024)).toBe(52 * 1024))
+      expect(source.bufferedRuns()).toEqual([
+        [10 * 1024, 12 * 1024],
+        [50 * 1024, 52 * 1024],
+      ])
+    })
+
+    it('reads nothing behind by default', async () => {
+      const { fetchChunk } = remoteFile(100 * 1024, 1024)
+      const source = new ChunkedSource({
+        size: 100 * 1024,
+        chunkSize: 1024,
+        fetchChunk,
+        readAhead: 1,
+      })
+      await source.read(50 * 1024, 10)
+      await vi.waitFor(() => expect(fetchChunk).toHaveBeenCalledTimes(2))
+      await new Promise((r) => setTimeout(r, 10))
+      expect(fetchChunk.mock.calls.map((c) => c[0]).sort()).toEqual([50, 51])
+    })
   })
 
   it('answers only the contiguous part when a chunk comes back short', async () => {
@@ -432,6 +571,28 @@ describe('loaded and read ahead', () => {
     await source.read(9300, 10)
     await vi.waitFor(() => expect(source.bufferedEnd(9300)).toBe(10_000))
     expect(source.bufferedEnd(10_000)).toBe(10_000)
+  })
+
+  it('sizes what is kept behind and away by time too, unless told how much', () => {
+    const fetchChunk = vi.fn(async () => new Uint8Array(0))
+    // 1.5 GB over 45 minutes: about 0.55 MB a second, so 32 MiB for a minute, 16 for half.
+    const auto = new ChunkedSource({ size: 1_500_000_000, fetchChunk })
+    auto.fitReadAhead(2700, { maxMiB: 128 })
+    const sizes = auto as unknown as Record<string, number>
+    expect([sizes.keepBehind, sizes.readBehind, sizes.keepAway]).toEqual([32, 16, 32])
+    expect(sizes.cacheChunks).toBe(48 + 32 + 32 + 8)
+    const given = new ChunkedSource({
+      size: 1_500_000_000,
+      fetchChunk,
+      keepBehind: 5,
+      readBehind: 2,
+    })
+    given.fitReadAhead(2700, { maxMiB: 128 })
+    const kept = given as unknown as Record<string, number>
+    expect([kept.keepBehind, kept.readBehind, kept.keepAway]).toEqual([5, 2, 32])
+    // Behind and away take at most half of what is kept ahead.
+    expect(behindChunks(60_000_000_000, 7200, { maxMiB: 64 })).toBe(64)
+    expect(behindChunks(50 * MiB, 600)).toBe(12)
   })
 
   it('reads a minute and a half ahead once the length is known, unless told how much', () => {

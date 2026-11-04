@@ -5,7 +5,16 @@ import type { ByteSource } from './byte-source.js'
 import { ChunkedSource, type ChunkedSourceOptions } from './chunked-source.js'
 
 export interface HttpSourceOptions extends Partial<
-  Pick<ChunkedSourceOptions, 'chunkSize' | 'cacheChunks' | 'readAhead' | 'concurrency'>
+  Pick<
+    ChunkedSourceOptions,
+    | 'chunkSize'
+    | 'cacheChunks'
+    | 'readAhead'
+    | 'keepBehind'
+    | 'readBehind'
+    | 'keepAway'
+    | 'concurrency'
+  >
 > {
   /** Extra request headers, for example `Authorization`. */
   headers?: HeadersInit
@@ -47,6 +56,9 @@ export async function httpSource(
     chunkSize: options.chunkSize,
     cacheChunks: options.cacheChunks,
     readAhead: options.readAhead,
+    keepBehind: options.keepBehind,
+    readBehind: options.readBehind,
+    keepAway: options.keepAway,
     concurrency: options.concurrency,
     async fetchChunk(index, chunkSize, signal) {
       const start = index * chunkSize
@@ -134,6 +146,7 @@ export function fileSource(file: Blob): ByteSource {
     createSideReader: () => source,
     // All of it is here: the timeline shows it loaded.
     bufferedEnd: () => file.size,
+    bufferedRuns: () => [[0, file.size]],
   }
   return source
 }
@@ -150,6 +163,7 @@ export function bufferSource(bytes: Uint8Array | ArrayBuffer): ByteSource {
     },
     createSideReader: () => source,
     bufferedEnd: () => data.byteLength,
+    bufferedRuns: () => [[0, data.byteLength]],
   }
   return source
 }

@@ -25,6 +25,8 @@ export interface ByteSource {
    * timeline; sources that cannot tell leave it out.
    */
   bufferedEnd?(offset: number): number
+  /** Every stretch downloaded, as [start, end) byte ranges in order, for the timeline. */
+  bufferedRuns?(): Array<[number, number]>
   /**
    * Told the video's length once it is known, so a source that reads ahead can size that by
    * time (see `ChunkedSource.fitReadAhead`). Sources that do not read ahead leave it out.

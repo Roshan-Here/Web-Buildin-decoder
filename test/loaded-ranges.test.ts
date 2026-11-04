@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { loadedUntil, playheadBytes, reportLoaded, withRange } from '../src/loaded-ranges.js'
+import {
+  loadedUntil,
+  otherRuns,
+  playheadBytes,
+  reportLoaded,
+  withRange,
+} from '../src/loaded-ranges.js'
 
 const pairs = (r: TimeRanges | null) =>
   r ? Array.from({ length: r.length }, (_, i) => [r.start(i), r.end(i)]) : null
@@ -48,5 +54,20 @@ describe('loaded ranges', () => {
     expect(pairs(element.buffered)).toEqual([[8, 40]])
     known = false
     expect(pairs(element.buffered)).toEqual([[8, 15]])
+  })
+  it('reports what is kept elsewhere too, and what was just played', () => {
+    // 1000 bytes over 100 s; playing at 10 s (byte 100), in a stretch from byte 50; another
+    // kept at bytes 400 to 600.
+    const runs = [
+      [50, 300],
+      [400, 600],
+    ] as const
+    expect(otherRuns({ from: 100, size: 1000, runs }, 10, 100)).toEqual([
+      [5, 10],
+      [40, 60],
+    ])
+    expect(otherRuns({ from: 100, size: 1000 }, 10, 100)).toEqual([])
+    // A lone chunk (the end of the file, read when it opened) is left off.
+    expect(otherRuns({ from: 100, size: 1000, runs: [[995, 1000]] }, 10, 100)).toEqual([])
   })
 })

@@ -165,12 +165,25 @@ this way.
 
 ### What is loaded
 
-`media.buffered` says how far the downloaded bytes reach, so your timeline can draw the loaded
-part: movi-player reports nothing for a source it is handed, so the decoder measures it from the
-source's `bufferedEnd`. A `ChunkedSource` (and so `httpSource`) reads about a minute and a half
-of the video ahead once it knows its length, as much as the device's memory allows (40 MiB on a
-phone, up to 128 MiB on a computer): a skip forward of ten or thirty seconds lands on bytes
-already here. Give `readAhead` to choose yourself.
+`media.buffered` says what is downloaded, so your timeline can draw the loaded part: movi-player
+reports nothing for a source it is handed, so the decoder measures it from the source's
+`bufferedEnd` and `bufferedRuns`. It gives the stretch around the playhead and every other one
+kept, each its own range.
+
+Once it knows the video's length, a `ChunkedSource` (and so `httpSource`) keeps in hand, as
+much as the device's memory allows:
+
+| What                                       | How much | Most (phone / computer) | So that                                    |
+| ------------------------------------------ | -------- | ----------------------- | ------------------------------------------ |
+| Read ahead of the picture                  | 90 s     | 40 / 128 MiB            | A skip forward lands on bytes already here |
+| What was just played                       | 60 s     | 20 / 64 MiB             | A skip back is as quick                    |
+| Before where playback started (a resume)   | 30 s     | 20 / 64 MiB             | A skip back right after a seek is too      |
+| Where playback was before a jump elsewhere | 60 s     | 20 / 64 MiB             | Going back there is instant                |
+
+What goes when memory fills is what is farthest from all of that, never the start and end of
+the file (the header and index a decoder reads again). After a small skip back, what had been
+read ahead stays and finishes downloading. Give `readAhead`, `keepBehind`, `readBehind` or
+`keepAway` to choose any of them yourself.
 
 ### Start fast
 
@@ -221,6 +234,8 @@ interface ByteSource {
   createSideReader?(): ByteSource
   /** Where the downloaded bytes from `offset` on run out, for the loaded part of the timeline. */
   bufferedEnd?(offset: number): number
+  /** Every stretch downloaded, as [start, end) byte ranges, for the timeline. */
+  bufferedRuns?(): Array<[number, number]>
   /** Told the video's length when it opens, to size a read ahead by time. */
   fitReadAhead?(durationSeconds: number): void
 }
@@ -230,17 +245,20 @@ interface ByteSource {
 
 For any server that answers `Range` requests (static hosts, S3, R2, GCS, most CDNs).
 
-| Option          | Default | What it does                                           |
-| --------------- | ------- | ------------------------------------------------------ |
-| `headers`       |         | Extra request headers, such as `Authorization`         |
-| `credentials`   |         | `'include'` to send cookies to another origin          |
-| `size`          | probed  | The file's size if you know it; saves one request      |
-| `chunkSize`     | 1 MiB   | Bytes per request                                      |
-| `cacheChunks`   | fitted  | Chunks kept in memory: the read ahead and 24 behind it |
-| `readAhead`     | fitted  | Chunks ahead of playback: 90 s of the video once open  |
-| `concurrency`   | 2       | Read-ahead downloads at once                           |
-| `prefetchStart` | `true`  | Fetch the head and tail of the file at once on opening |
-| `fetch`         | `fetch` | Your own `fetch`, for signing requests or tests        |
+| Option          | Default | What it does                                            |
+| --------------- | ------- | ------------------------------------------------------- |
+| `headers`       |         | Extra request headers, such as `Authorization`          |
+| `credentials`   |         | `'include'` to send cookies to another origin           |
+| `size`          | probed  | The file's size if you know it; saves one request       |
+| `chunkSize`     | 1 MiB   | Bytes per request                                       |
+| `cacheChunks`   | fitted  | Chunks kept in memory: all of the below and 8 spare     |
+| `readAhead`     | fitted  | Chunks ahead of playback: 90 s of the video once open   |
+| `keepBehind`    | fitted  | Chunks of what was just played kept: 60 s               |
+| `readBehind`    | fitted  | Chunks before a seek or resume fetched: 30 s            |
+| `keepAway`      | fitted  | Chunks kept from where playback was before a jump: 60 s |
+| `concurrency`   | 2       | Read-ahead downloads at once                            |
+| `prefetchStart` | `true`  | Fetch the head and tail of the file at once on opening  |
+| `fetch`         | `fetch` | Your own `fetch`, for signing requests or tests         |
 
 On another origin the server must allow it by CORS and expose `Content-Range`
 (`Access-Control-Expose-Headers: Content-Range`), unless you pass `size`. Pass
@@ -271,8 +289,9 @@ read ahead from where playback was, which is cancelled.
 
 Left to itself, the read ahead starts at 4 chunks and becomes about 90 seconds of the video when
 the decoder opens the file (`fitReadAhead(duration)`), from 12 MiB up to what the device can
-hold (`aheadCap()`). `readAheadChunks(size, duration, { seconds, maxMiB })` works the size out
-for your own sources.
+hold (`aheadCap()`), with what is kept behind the playhead and away from it sized the same way
+(see "What is loaded"). `readAheadChunks(size, duration, { seconds, maxMiB })` and
+`behindChunks(size, duration, { seconds, maxMiB })` work the sizes out for your own sources.
 
 ```ts
 import { ChunkedSource, createBuiltinDecoder } from 'web-buildin-decoder'
@@ -321,7 +340,7 @@ await createBuiltinDecoder({ host, source, key: id })
 | `HttpSourceError`, `isPermanentHttpError`                 | HTTP read failures                                  |
 | `CaptionRenderer`, `packetText`, `isTextSubtitle`         | The subtitle renderer the decoder uses              |
 | `isPictureSubtitle`, `isShownSubtitle`, `PictureFrame`    | Picture subtitles (PGS, VobSub, DVB, XSUB)          |
-| `readAheadChunks`, `aheadCap`                             | How much to read ahead, by time and by device       |
+| `readAheadChunks`, `behindChunks`, `aheadCap`             | How much to keep, by time and by device             |
 | `reportLoaded`, `loadedUntil`, `playheadBytes`            | The loaded range, for a `<video>` over a source     |
 | `playability`, `effectiveMimeType`, `browserCanPlay`      | Can the browser's own `<video>` play a file?        |
 | `languageName`, `sameLanguage`, `describeCodec`           | "eng" → "English", "ac3", 6 → "AC-3 5.1"            |
@@ -420,7 +439,11 @@ A few things the decoder handles so you do not have to:
   pictures (run-length decoding, palettes, YCbCr to RGB), timed and handed over through
   `onPicture`, so no second decoder is needed.
 - **The loaded range.** movi-player knows nothing of a source's cache; the decoder reports it
-  through `media.buffered`, from where the decoder reads to where the downloaded bytes end.
+  through `media.buffered`, from where the decoder reads to where the downloaded bytes end,
+  and every other stretch kept.
+- **Skips back as quick as skips forward.** What was just played, the half minute before a
+  seek, and where playback was before a jump stay in memory; the farthest from all of it goes
+  first.
 - **Subtitles turned on mid-line.** Subtitle packets arrive with the stream, so turning
   subtitles on re-reads from the last keyframe (the bytes are in the cache) to pick up the line
   already on screen.

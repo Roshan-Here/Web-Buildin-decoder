@@ -22,11 +22,19 @@ export {
   ChunkedSource,
   DEFAULT_CHUNK_SIZE,
   aheadCap,
+  behindChunks,
   readAheadChunks,
   type ChunkedSourceOptions,
   type FitReadAheadOptions,
 } from './chunked-source.js'
-export { loadedUntil, playheadBytes, reportLoaded, withRange } from './loaded-ranges.js'
+export {
+  loadedUntil,
+  otherRuns,
+  playheadBytes,
+  reportLoaded,
+  withRange,
+  withRanges,
+} from './loaded-ranges.js'
 export {
   httpSource,
   fileSource,
