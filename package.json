@@ -1,6 +1,6 @@
 {
   "name": "web-buildin-decoder",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A built-in video decoder for the web: plays MKV, HEVC, AC-3, DTS, multi-track audio and embedded subtitles in any modern browser, under your own player controls.",
   "keywords": [
     "video",
@@ -13,6 +13,8 @@
     "ac3",
     "dts",
     "subtitles",
+    "pgs",
+    "vobsub",
     "webassembly",
     "ffmpeg",
     "webcodecs",

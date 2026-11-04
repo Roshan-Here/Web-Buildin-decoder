@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-11-04
+
+### Added
+
+- Picture subtitles: PGS (Blu-ray), VobSub (DVD), DVB and XSUB tracks are selectable now. They
+  are decoded in JavaScript and come through the new `onPicture(listener)` as RGBA pictures on
+  the subtitle's own canvas (`PictureFrame`); their tracks have `picture: true`. The subtitle
+  delay moves them too. `isPictureSubtitle()` and `isShownSubtitle()` tell the codecs apart.
+- The loaded range: `media.buffered` on the built-in decoder now says how far the downloaded
+  bytes reach (movi-player reported nothing for a source it is handed). Sources say so through
+  the new optional `ByteSource.bufferedEnd(offset)`, which `ChunkedSource`, `httpSource`,
+  `fileSource` and `bufferSource` have. `reportLoaded()`, `loadedUntil()` and `playheadBytes()`
+  do the same for a browser `<video>` over a source.
+- `ChunkedSource.fitReadAhead(duration, { seconds, maxMiB })`, `readAheadChunks()` and
+  `aheadCap()`: read ahead sized by time and by the device's memory.
+- XSUB is named in codec details.
+
+### Changed
+
+- A `ChunkedSource` given no `readAhead` reads about 90 seconds of the video ahead once the
+  decoder opens it (it called `fitReadAhead`), from 12 MiB up to 40 MiB on a phone and 128 MiB
+  on a computer, instead of 4 chunks; with no `cacheChunks`, it keeps that and 24 chunks behind.
+  A skip of ten or thirty seconds now lands on bytes already downloaded. Pass `readAhead` (and
+  `cacheChunks`) to keep the old sizes.
+
 ## [0.2.0] - 2026-10-28
 
 ### Changed
@@ -51,5 +76,6 @@ First release.
 - Replaceable English text (`messages`), language names in any locale, and an in-memory
   diagnostics log with `diagnosticsReport()`.
 
+[0.3.0]: https://github.com/Roshan-Here/Web-Buildin-decoder/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Roshan-Here/Web-Buildin-decoder/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Roshan-Here/Web-Buildin-decoder/releases/tag/v0.1.0

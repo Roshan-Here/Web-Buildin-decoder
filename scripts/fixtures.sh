@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 # Makes the test videos for the example and the browser check (needs ffmpeg with libx265).
 set -e
-dir="$(dirname "$0")/../examples/basic/media"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+dir="$root/examples/basic/media"
 mkdir -p "$dir"
 cd "$dir"
 printf '1\n00:00:00,500 --> 00:00:15,000\nHello from the English track\n\n2\n00:00:15,000 --> 00:00:30,000\nSecond English line\n' > en.srt
@@ -21,4 +22,12 @@ ffmpeg -loglevel error -y \
   -f lavfi -i testsrc2=size=854x480:rate=24 -f lavfi -i sine=frequency=440:sample_rate=48000 \
   -t 30 -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac \
   sample-h264.mkv
+# A PGS subtitle track (a yellow box from 1 s to 4 s, every ten seconds), written by the test
+# writer, for the picture subtitle check.
+node --experimental-strip-types --no-warnings "$root/scripts/make-picture-subs.ts" picture-subs.sup
+ffmpeg -loglevel error -y \
+  -f lavfi -i testsrc2=size=854x480:rate=24 -f lavfi -i sine=frequency=330:sample_rate=48000 \
+  -i picture-subs.sup -map 0:v -map 1:a -map 2:s -t 30 \
+  -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest -copyts -c:s copy \
+  -metadata:s:s:0 language=eng sample-pgs.mkv
 echo "Test videos written to $(pwd)"

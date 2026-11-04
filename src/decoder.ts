@@ -3,11 +3,13 @@
 
 import type { MoviElement, MoviPlayer } from 'movi-player'
 import type { ByteSource } from './byte-source.js'
-import { CaptionRenderer, isTextSubtitle } from './captions.js'
+import { CaptionRenderer, isPictureSubtitle, isShownSubtitle } from './captions.js'
 import { logDecoder } from './diagnostics.js'
+import { playheadBytes, reportLoaded } from './loaded-ranges.js'
 import { describeCodec, languageName } from './languages.js'
 import { createDecoderElement, type LoaderOptions } from './loader.js'
 import { resolveMessages, type DecoderMessages } from './messages.js'
+import type { PictureFrame } from './picture-subs/frame.js'
 import { ByteSourceAdapter } from './source-adapter.js'
 import {
   Signal,
@@ -77,7 +79,11 @@ export async function createBuiltinDecoder(options: BuiltinDecoderOptions): Prom
     cleanups.push(() => element.removeEventListener(type, handler))
   }
 
-  const captions = new CaptionRenderer((text) => captionChanged.emit(text))
+  const pictureChanged = new Signal<[PictureFrame | null]>()
+  const captions = new CaptionRenderer(
+    (text) => captionChanged.emit(text),
+    (frame) => pictureChanged.emit(frame),
+  )
   element.setSubtitleRenderer(captions)
 
   let wantedSubtitle: number | null = null
@@ -128,6 +134,8 @@ export async function createBuiltinDecoder(options: BuiltinDecoderOptions): Prom
     if (wantedDelay !== 0) p?.setSubtitleDelay(wantedDelay)
     applyPictureHolds()
     if (previewsWanted) routePreviewReads()
+    // Its length known, the source reads ahead by time (a minute and a half, where it can).
+    if (element.duration > 0) options.source.fitReadAhead?.(element.duration)
     tracksChanged.emit()
   })
   on('trackschange', () => tracksChanged.emit())
@@ -182,6 +190,16 @@ export async function createBuiltinDecoder(options: BuiltinDecoderOptions): Prom
   }
   /** Playback's reader; a new one only if the decoder has to be handed the file again. */
   let adapter = openAdapter()
+
+  // The timeline's loaded part: movi-player reports none for a source it is handed, so it is
+  // measured here, from where the decoder has read to on to where the downloaded bytes end.
+  const { source } = options
+  if (source.bufferedEnd) {
+    reportLoaded(element, (time, duration) => {
+      const from = playheadBytes(time, duration, source.size, adapter.getPosition())
+      return from === null ? null : { from, end: source.bufferedEnd!(from), size: source.size }
+    })
+  }
 
   // Timeline previews. movi-player makes them with a second, keyframe-only decoder, but for a
   // source adapter it reads through the very adapter playback uses. A chunk cache with read
@@ -282,10 +300,11 @@ export async function createBuiltinDecoder(options: BuiltinDecoderOptions): Prom
           id: String(track.id),
           label: track.label || nameOf(track.language) || messages.subtitleTrack(i + 1),
           language: track.language ?? null,
-          detail: isTextSubtitle(track.codec)
+          detail: isShownSubtitle(track.codec)
             ? describeCodec(track.codec, undefined, messages)
             : messages.codecUnsupported(describeCodec(track.codec, undefined, messages) ?? ''),
-          selectable: isTextSubtitle(track.codec),
+          selectable: isShownSubtitle(track.codec),
+          picture: isPictureSubtitle(track.codec),
         })),
         selected: wantedSubtitle === null ? null : String(wantedSubtitle),
       }
@@ -312,6 +331,7 @@ export async function createBuiltinDecoder(options: BuiltinDecoderOptions): Prom
     },
     onTracks: (listener) => tracksChanged.add(listener),
     onCaption: (listener) => captionChanged.add(listener),
+    onPicture: (listener) => pictureChanged.add(listener),
     onFailure: (listener) => failed.add(listener),
     captureStream: () => capture(),
     video: null,
@@ -376,6 +396,7 @@ export async function createBuiltinDecoder(options: BuiltinDecoderOptions): Prom
       for (const cleanup of cleanups) cleanup()
       tracksChanged.clear()
       captionChanged.clear()
+      pictureChanged.clear()
       failed.clear()
       element.remove()
       for (const opened of adapters) opened.close()

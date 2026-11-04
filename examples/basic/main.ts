@@ -6,11 +6,14 @@ import {
   preloadDecoder,
   type ByteSource,
   type MediaEngine,
+  type PictureFrame,
 } from '../../src/index.js'
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
 const stage = $<HTMLDivElement>('stage')
 const captions = $<HTMLDivElement>('captions')
+const pictures = $<HTMLCanvasElement>('pictures')
+const loaded = $<HTMLSpanElement>('loaded')
 const play = $<HTMLButtonElement>('play')
 const seek = $<HTMLInputElement>('seek')
 const time = $<HTMLSpanElement>('time')
@@ -47,10 +50,11 @@ async function open(source: ByteSource, key: string) {
     key,
     isPermanent: isPermanentHttpError,
   })
-  stage.append(captions) // keep captions above the picture
+  stage.append(pictures, captions) // keep subtitles above the picture
   const { media } = decoder
 
   decoder.onCaption((text) => (captions.textContent = text ?? ''))
+  decoder.onPicture?.(drawPictures)
   decoder.onFailure((failure) => (status.textContent = `${failure.title}: ${failure.message}`))
   decoder.onTracks(() => renderTracks(decoder!))
 
@@ -63,6 +67,12 @@ async function open(source: ByteSource, key: string) {
   media.addEventListener('timeupdate', () => {
     seek.value = String(media.currentTime)
     time.textContent = `${clock(media.currentTime)} / ${clock(media.duration)}`
+    // How far the downloaded bytes reach: the read ahead, a minute and a half where it can.
+    const ranges = media.buffered
+    let end = media.currentTime
+    for (let i = 0; i < ranges.length; i++)
+      if (ranges.start(i) <= media.currentTime + 0.5) end = Math.max(end, ranges.end(i))
+    loaded.textContent = `loaded to ${clock(end)}`
   })
   media.addEventListener('play', () => (play.textContent = 'Pause'))
   media.addEventListener('pause', () => (play.textContent = 'Play'))
@@ -96,6 +106,29 @@ function renderTracks(engine: MediaEngine) {
     }),
   )
   subtitles.value = s.selected ?? ''
+}
+
+/**
+ * Picture subtitles (PGS, VobSub, DVB, XSUB): the pictures where the file puts them on its own
+ * canvas; the canvas is stretched over the picture, so they land where the file meant.
+ */
+function drawPictures(frame: PictureFrame | null) {
+  const context = pictures.getContext('2d')
+  if (!context) return
+  if (!frame) {
+    context.clearRect(0, 0, pictures.width, pictures.height)
+    return
+  }
+  pictures.width = frame.canvasWidth
+  pictures.height = frame.canvasHeight
+  for (const p of frame.pictures) {
+    if (p.width > 0 && p.height > 0)
+      context.putImageData(
+        new ImageData(new Uint8ClampedArray(p.rgba), p.width, p.height),
+        p.x,
+        p.y,
+      )
+  }
 }
 
 function clock(seconds: number) {

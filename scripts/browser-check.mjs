@@ -1,10 +1,10 @@
 // Plays the test videos in headless Chromium through the example page and checks that the
 // picture moves, the tracks are listed, subtitles show, audio switches, seeking and timeline
-// previews work. Run `npm run fixtures` first; needs `npx playwright install chromium`.
+// previews work, picture subtitles (PGS) are drawn and the read ahead shows on the timeline. Run `npm run fixtures` first; needs `npx playwright install chromium`.
 import { chromium } from 'playwright'
 import { createServer } from 'vite'
 
-const files = ['sample-hevc-ac3.mkv', 'sample-h264.mkv']
+const files = ['sample-hevc-ac3.mkv', 'sample-h264.mkv', 'sample-pgs.mkv']
 const server = await createServer({
   root: 'examples/basic',
   configFile: 'examples/basic/vite.config.ts',
@@ -43,7 +43,34 @@ try {
       tracks.audio.options.length > 0,
       `lists audio: ${tracks.audio.options.map((o) => `${o.label} (${o.detail})`).join(', ')}`,
     )
-    if (tracks.subs.options.length > 0) {
+    // The downloaded part reaches past the playhead (all of it, for these small files).
+    const loadedTo = await page.evaluate(() => {
+      const m = globalThis.__decoder().media
+      return m.buffered.length > 0 ? m.buffered.end(m.buffered.length - 1) - m.currentTime : 0
+    })
+    check(loadedTo > 5, `shows what is loaded ahead (${loadedTo.toFixed(1)} s)`)
+    if (tracks.subs.options.length > 0 && tracks.subs.options[0].picture) {
+      const sub = tracks.subs.options[0]
+      check(sub.selectable, `lists picture subtitles: ${sub.label} (${sub.detail})`)
+      await page.evaluate(() => (globalThis.__decoder().media.currentTime = 10.5))
+      await page.selectOption('#subtitles', sub.id)
+      const drawn = await page
+        .waitForFunction(
+          () => {
+            const canvas = document.querySelector('#pictures')
+            if (!canvas || canvas.width !== 854) return false
+            const [r, g, b, a] = canvas.getContext('2d').getImageData(427, 424, 1, 1).data
+            return r > 200 && g > 170 && b < 90 && a > 200
+          },
+          null,
+          { timeout: 15_000 },
+        )
+        .then(
+          () => true,
+          () => false,
+        )
+      check(drawn, 'draws picture subtitles where the file puts them')
+    } else if (tracks.subs.options.length > 0) {
       await page.selectOption('#subtitles', tracks.subs.options[0].id)
       const caption = await page
         .waitForFunction(() => document.querySelector('#captions').textContent.length > 0, null, {

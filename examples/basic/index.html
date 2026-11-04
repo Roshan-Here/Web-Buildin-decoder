@@ -34,6 +34,13 @@
           0 0 2px #000;
         pointer-events: none;
       }
+      .pictures {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
       .row {
         display: flex;
         flex-wrap: wrap;
@@ -65,11 +72,15 @@
       />
       <button id="open">Open URL</button>
     </div>
-    <div class="stage" id="stage"><div class="captions" id="captions"></div></div>
+    <div class="stage" id="stage">
+      <canvas class="pictures" id="pictures"></canvas>
+      <div class="captions" id="captions"></div>
+    </div>
     <div class="row">
       <button id="play" disabled>Play</button>
       <input id="seek" type="range" min="0" max="0" step="0.1" value="0" disabled />
       <span id="time">0:00 / 0:00</span>
+      <span id="loaded" class="loaded"></span>
     </div>
     <div class="row">
       <label

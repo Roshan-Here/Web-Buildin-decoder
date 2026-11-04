@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { ChunkedSource } from '../src/chunked-source.js'
+import { ChunkedSource, aheadCap, readAheadChunks } from '../src/chunked-source.js'
 
 /** A fake remote file whose byte at offset n is n % 251. */
 function remoteFile(size: number, chunkSize: number) {
@@ -416,5 +416,51 @@ describe('ChunkedSource', () => {
       expect(fetchChunk.mock.calls.map((c) => c[0])).not.toContain(0)
       expect(fetchChunk.mock.calls.map((c) => c[0])).not.toContain(63)
     })
+  })
+})
+
+describe('loaded and read ahead', () => {
+  it('says how far the bytes in hand reach from a point', async () => {
+    const { fetchChunk } = remoteFile(10_000, 1024)
+    const source = new ChunkedSource({ size: 10_000, chunkSize: 1024, fetchChunk, readAhead: 3 })
+    expect(source.bufferedEnd(100)).toBe(100)
+    await source.read(100, 10)
+    await vi.waitFor(() => expect(source.bufferedEnd(100)).toBe(4096))
+    // From inside what is here, to its end; from a hole, nothing.
+    expect(source.bufferedEnd(3000)).toBe(4096)
+    expect(source.bufferedEnd(5000)).toBe(5000)
+    await source.read(9300, 10)
+    await vi.waitFor(() => expect(source.bufferedEnd(9300)).toBe(10_000))
+    expect(source.bufferedEnd(10_000)).toBe(10_000)
+  })
+
+  it('reads a minute and a half ahead once the length is known, unless told how much', () => {
+    const MiB = 1024 * 1024
+    const fetchChunk = vi.fn(async () => new Uint8Array(0))
+    // 1.5 GB over 45 minutes: about 0.55 MB a second, so 48 MiB for 90 seconds.
+    const auto = new ChunkedSource({ size: 1_500_000_000, fetchChunk })
+    expect(auto.readAheadChunks).toBe(4)
+    auto.fitReadAhead(2700, { maxMiB: 128 })
+    expect(auto.readAheadChunks).toBe(48)
+    const fixed = new ChunkedSource({ size: 1_500_000_000, fetchChunk, readAhead: 6 })
+    fixed.fitReadAhead(2700)
+    expect(fixed.readAheadChunks).toBe(6)
+    // Smaller chunks: the same bytes, in more of them.
+    const quarter = new ChunkedSource({ size: 50 * MiB, chunkSize: MiB / 4, fetchChunk })
+    quarter.fitReadAhead(600, { maxMiB: 128 })
+    expect(quarter.readAheadChunks).toBe(48)
+  })
+
+  it('stays within what the device can hold', () => {
+    expect(readAheadChunks(60_000_000_000, 7200, { maxMiB: 128 })).toBe(128)
+    expect(readAheadChunks(60_000_000_000, 7200, { maxMiB: 40 })).toBe(40)
+    expect(readAheadChunks(2_000_000_000, 7200, { maxMiB: 128 })).toBe(24)
+    expect(readAheadChunks(2_000_000_000, 0, { maxMiB: 128 })).toBe(24)
+    expect(readAheadChunks(2_000_000_000, 7200, { maxMiB: 128, seconds: 30 })).toBe(12)
+    expect(aheadCap({ deviceMemory: 8 })).toBe(128)
+    expect(aheadCap({ deviceMemory: 4 })).toBe(64)
+    expect(aheadCap({ deviceMemory: 2 })).toBe(40)
+    expect(aheadCap({ maxTouchPoints: 5 })).toBe(40)
+    expect(aheadCap({ maxTouchPoints: 0 })).toBe(128)
   })
 })

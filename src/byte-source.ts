@@ -19,4 +19,15 @@ export interface ByteSource {
    * neither moves the read ahead nor pushes playback's chunks out of the cache.
    */
   createSideReader?(): ByteSource
+  /**
+   * Where the bytes already downloaded from [offset] on run out: [offset] itself when that byte
+   * is not here yet, the size when everything to the end is. For the loaded part of the
+   * timeline; sources that cannot tell leave it out.
+   */
+  bufferedEnd?(offset: number): number
+  /**
+   * Told the video's length once it is known, so a source that reads ahead can size that by
+   * time (see `ChunkedSource.fitReadAhead`). Sources that do not read ahead leave it out.
+   */
+  fitReadAhead?(durationSeconds: number): void
 }

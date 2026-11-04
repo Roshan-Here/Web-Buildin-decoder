@@ -2,6 +2,17 @@
 // Copyright (c) 2026 Roshan-Here (https://github.com/Roshan-Here) - Web-Buildin-decoder
 
 import type { Packet, SubtitleRenderer, SubtitleTrack } from 'movi-player'
+import {
+  frameOf,
+  isPictureSubtitle,
+  pictureDecoderFor,
+  PictureTimeline,
+  type PictureFrame,
+} from './picture-subs/index.js'
+import type { PictureDecoder, PictureEvent } from './picture-subs/frame.js'
+
+export { isPictureSubtitle } from './picture-subs/index.js'
+export type { PictureFrame } from './picture-subs/index.js'
 
 export interface Cue {
   start: number
@@ -9,7 +20,7 @@ export interface Cue {
   text: string
 }
 
-/** Text subtitle codecs this renderer reads. Picture ones (PGS, VobSub, DVB) are not text. */
+/** Text subtitle codecs this renderer reads; picture ones (PGS, VobSub, DVB) are drawn apart. */
 const TEXT_CODECS = new Set(['subrip', 'srt', 'text', 'ass', 'ssa', 'webvtt', 'mov_text'])
 
 export function isTextSubtitle(codec: string): boolean {
@@ -64,10 +75,17 @@ export function packetText(codec: string, data: Uint8Array): string {
     .join('\n')
 }
 
+/** Whether this player shows a subtitle codec: text, or pictures (PGS, VobSub, DVB). */
+export function isShownSubtitle(codec: string): boolean {
+  return isTextSubtitle(codec) || isPictureSubtitle(codec)
+}
+
 /**
  * movi-player's pluggable subtitle renderer, kept to what a custom player needs: it collects the
- * cues of the selected text track and reports the text that should be on screen, so your
- * player draws captions itself, in its own style and above its own controls.
+ * selected track's cues and reports what should be on screen, so your player draws subtitles
+ * itself, above the picture and its own controls: the text of a text track, in its own style,
+ * and the pictures of a picture track (PGS, VobSub, DVB, XSUB), decoded here (picture-subs/),
+ * as the file has them.
  */
 export class CaptionRenderer implements SubtitleRenderer {
   private codec = 'subrip'
@@ -75,17 +93,35 @@ export class CaptionRenderer implements SubtitleRenderer {
   private delay = 0
   private shown: string | null = null
   private readonly onChange: (text: string | null) => void
+  private readonly onPicture: (frame: PictureFrame | null) => void
+  private pictureDecoder: PictureDecoder | null = null
+  private readonly pictures = new PictureTimeline()
+  private shownPicture: { event: PictureEvent; width: number; height: number } | null = null
 
-  constructor(onChange: (text: string | null) => void) {
+  constructor(
+    onChange: (text: string | null) => void,
+    onPicture: (frame: PictureFrame | null) => void = () => undefined,
+  ) {
     this.onChange = onChange
+    this.onPicture = onPicture
   }
 
-  configure(track: SubtitleTrack): void {
+  configure(track: SubtitleTrack, extradata?: Uint8Array): void {
     this.codec = track.codec
+    this.pictureDecoder = pictureDecoderFor(track.codec, extradata)
     this.reset()
   }
 
   pushPacket(packet: Packet): void {
+    if (this.pictureDecoder) {
+      for (const event of this.pictureDecoder.decode(
+        packet.data,
+        packet.timestamp,
+        packet.duration > 0 ? packet.duration : 0,
+      ))
+        this.pictures.add(event)
+      return
+    }
     if (!isTextSubtitle(this.codec)) return
     const text = packetText(this.codec, packet.data)
     if (!text) return
@@ -97,8 +133,13 @@ export class CaptionRenderer implements SubtitleRenderer {
     this.cues.sort((a, b) => a.start - b.start)
   }
 
-  render(mediaTime: number): void {
+  render(mediaTime: number, videoWidth = 0, videoHeight = 0): void {
     const t = mediaTime - this.delay
+    if (this.pictureDecoder) {
+      this.pictures.forgetBefore(t)
+      this.showPicture(this.pictures.at(t), videoWidth, videoHeight)
+      return
+    }
     this.cues = this.cues.filter((c) => endOf(c, this.cues) > t - KEEP_BEHIND_SECONDS)
     const active = this.cues.filter((c) => c.start <= t && t < endOf(c, this.cues))
     this.show(active.length > 0 ? active.map((c) => c.text).join('\n') : null)
@@ -116,14 +157,28 @@ export class CaptionRenderer implements SubtitleRenderer {
     this.reset()
   }
 
-  /** The cues currently held, for tests. */
+  /** The cues (or picture screens) currently held, for tests. */
   get size(): number {
-    return this.cues.length
+    return this.pictureDecoder ? this.pictures.size : this.cues.length
   }
 
   private reset(): void {
     this.cues = []
+    this.pictures.clear()
+    this.pictureDecoder?.reset()
     this.show(null)
+    this.showPicture(null, 0, 0)
+  }
+
+  private showPicture(event: PictureEvent | null, width: number, height: number): void {
+    const was = this.shownPicture
+    if (
+      event === (was?.event ?? null) &&
+      (!event || (was?.width === width && was.height === height))
+    )
+      return
+    this.shownPicture = event ? { event, width, height } : null
+    this.onPicture(event ? frameOf(event, width, height) : null)
   }
 
   private show(text: string | null): void {

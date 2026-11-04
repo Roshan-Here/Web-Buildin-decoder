@@ -35,15 +35,15 @@ Created by **[Roshan-Here](https://github.com/Roshan-Here)**.
 
 ## What it plays
 
-|               | Supported                                                         |
-| ------------- | ----------------------------------------------------------------- |
-| Containers    | MP4 / MOV, WebM, MKV, AVI, MPEG-TS                                |
-| Video         | H.264, HEVC (H.265), VP9, AV1                                     |
-| Audio         | AAC, AC-3, E-AC-3, DTS, TrueHD, Opus                              |
-| Subtitles     | SRT, ASS/SSA, WebVTT, MP4 timed text (as text, drawn by your app) |
-| Audio tracks  | Every track, switchable while playing                             |
-| Also          | Chapters, timeline preview stills, picture in picture             |
-| Not yet shown | Picture subtitles (PGS, VobSub, DVB): listed but not selectable   |
+|              | Supported                                                         |
+| ------------ | ----------------------------------------------------------------- |
+| Containers   | MP4 / MOV, WebM, MKV, AVI, MPEG-TS                                |
+| Video        | H.264, HEVC (H.265), VP9, AV1                                     |
+| Audio        | AAC, AC-3, E-AC-3, DTS, TrueHD, Opus                              |
+| Subtitles    | SRT, ASS/SSA, WebVTT, MP4 timed text (as text, drawn by your app) |
+| Picture subs | PGS (Blu-ray), VobSub (DVD), DVB, XSUB (as pictures, see below)   |
+| Audio tracks | Every track, switchable while playing                             |
+| Also         | Chapters, timeline preview stills, picture in picture             |
 
 Where the device has no hardware decoder for the picture (HEVC on many PCs, for example), the
 decoder switches to software decoding by itself and carries on from where it was.
@@ -141,6 +141,37 @@ Draw captions yourself from `onCaption`, in your own style and above your contro
 labels use the track's title, then its language name in the browser's language ("English",
 "Englisch"), then "Track 1"; codec details read like "AC-3 5.1".
 
+### Picture subtitles
+
+Blu-ray (PGS), DVD (VobSub), digital TV (DVB) and DivX (XSUB) subtitles are pictures, not text.
+The decoder decodes them in JavaScript and hands you what is on screen through `onPicture`:
+RGBA pictures placed on the subtitle's own canvas (the size of the video it was made for).
+Their tracks have `picture: true`.
+
+```ts
+decoder.onPicture?.((frame) => {
+  // null: nothing on screen
+  if (!frame) return context.clearRect(0, 0, canvas.width, canvas.height)
+  canvas.width = frame.canvasWidth
+  canvas.height = frame.canvasHeight
+  for (const p of frame.pictures)
+    context.putImageData(new ImageData(new Uint8ClampedArray(p.rgba), p.width, p.height), p.x, p.y)
+})
+```
+
+Stretch that canvas over the picture as it is shown (letterboxing included) and the pictures
+land where the file meant them. The subtitle delay moves them too. The example page draws them
+this way.
+
+### What is loaded
+
+`media.buffered` says how far the downloaded bytes reach, so your timeline can draw the loaded
+part: movi-player reports nothing for a source it is handed, so the decoder measures it from the
+source's `bufferedEnd`. A `ChunkedSource` (and so `httpSource`) reads about a minute and a half
+of the video ahead once it knows its length, as much as the device's memory allows (40 MiB on a
+phone, up to 128 MiB on a computer): a skip forward of ten or thirty seconds lands on bytes
+already here. Give `readAhead` to choose yourself.
+
 ### Start fast
 
 ```ts
@@ -188,6 +219,10 @@ interface ByteSource {
   readonly size: number
   read(offset: number, length: number): Promise<Uint8Array>
   createSideReader?(): ByteSource
+  /** Where the downloaded bytes from `offset` on run out, for the loaded part of the timeline. */
+  bufferedEnd?(offset: number): number
+  /** Told the video's length when it opens, to size a read ahead by time. */
+  fitReadAhead?(durationSeconds: number): void
 }
 ```
 
@@ -201,8 +236,8 @@ For any server that answers `Range` requests (static hosts, S3, R2, GCS, most CD
 | `credentials`   |         | `'include'` to send cookies to another origin          |
 | `size`          | probed  | The file's size if you know it; saves one request      |
 | `chunkSize`     | 1 MiB   | Bytes per request                                      |
-| `cacheChunks`   | 32      | Chunks kept in memory                                  |
-| `readAhead`     | 4       | Chunks downloaded ahead of playback                    |
+| `cacheChunks`   | fitted  | Chunks kept in memory: the read ahead and 24 behind it |
+| `readAhead`     | fitted  | Chunks ahead of playback: 90 s of the video once open  |
 | `concurrency`   | 2       | Read-ahead downloads at once                           |
 | `prefetchStart` | `true`  | Fetch the head and tail of the file at once on opening |
 | `fetch`         | `fetch` | Your own `fetch`, for signing requests or tests        |
@@ -233,6 +268,11 @@ Downloads are scheduled by who is waiting, since every download in flight shares
 
 After a seek, the chunk the picture needs gets the link to itself instead of sharing it with
 read ahead from where playback was, which is cancelled.
+
+Left to itself, the read ahead starts at 4 chunks and becomes about 90 seconds of the video when
+the decoder opens the file (`fitReadAhead(duration)`), from 12 MiB up to what the device can
+hold (`aheadCap()`). `readAheadChunks(size, duration, { seconds, maxMiB })` works the size out
+for your own sources.
 
 ```ts
 import { ChunkedSource, createBuiltinDecoder } from 'web-buildin-decoder'
@@ -280,6 +320,9 @@ await createBuiltinDecoder({ host, source, key: id })
 | `ByteSourceAdapter`                                       | Feeds a `ByteSource` to movi-player, with retries   |
 | `HttpSourceError`, `isPermanentHttpError`                 | HTTP read failures                                  |
 | `CaptionRenderer`, `packetText`, `isTextSubtitle`         | The subtitle renderer the decoder uses              |
+| `isPictureSubtitle`, `isShownSubtitle`, `PictureFrame`    | Picture subtitles (PGS, VobSub, DVB, XSUB)          |
+| `readAheadChunks`, `aheadCap`                             | How much to read ahead, by time and by device       |
+| `reportLoaded`, `loadedUntil`, `playheadBytes`            | The loaded range, for a `<video>` over a source     |
 | `playability`, `effectiveMimeType`, `browserCanPlay`      | Can the browser's own `<video>` play a file?        |
 | `languageName`, `sameLanguage`, `describeCodec`           | "eng" → "English", "ac3", 6 → "AC-3 5.1"            |
 | `defaultMessages`, `DecoderMessages`                      | The English text, to translate                      |
@@ -373,6 +416,11 @@ A few things the decoder handles so you do not have to:
   Previews get their own reader over the chunk cache instead, and the preview decoder is only
   started the first time the pointer reaches the timeline. A preview asked for while another
   is being made waits its turn rather than coming back empty.
+- **Picture subtitles.** PGS, VobSub, DVB and XSUB packets are decoded in JavaScript to RGBA
+  pictures (run-length decoding, palettes, YCbCr to RGB), timed and handed over through
+  `onPicture`, so no second decoder is needed.
+- **The loaded range.** movi-player knows nothing of a source's cache; the decoder reports it
+  through `media.buffered`, from where the decoder reads to where the downloaded bytes end.
 - **Subtitles turned on mid-line.** Subtitle packets arrive with the stream, so turning
   subtitles on re-reads from the last keyframe (the bytes are in the cache) to pick up the line
   already on screen.
@@ -392,8 +440,9 @@ npm run test:browser   # plays the test videos in headless Chromium and checks t
 ```
 
 The browser check plays an HEVC + AC-3 Matroska file with two audio tracks and two subtitle
-tracks, and an H.264 one, and checks playback, track lists, subtitles, audio switching, seeking
-and timeline previews. See [CONTRIBUTING.md](CONTRIBUTING.md).
+tracks, an H.264 one, and one with a PGS track, and checks playback, track lists, subtitles,
+picture subtitles, the loaded range, audio switching, seeking and timeline previews. The PGS
+track is written by `scripts/make-picture-subs.ts` (Node 22.6 or later). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Credits
 

@@ -134,6 +134,7 @@ const CODEC_NAMES: Record<string, string> = {
   hdmv_pgs_subtitle: 'PGS',
   dvd_subtitle: 'VobSub',
   dvb_subtitle: 'DVB',
+  xsub: 'XSUB',
 }
 
 /** A codec and channel count as people read them: "ac3", 6 becomes "AC-3 5.1". */

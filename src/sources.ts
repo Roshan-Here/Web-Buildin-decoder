@@ -132,6 +132,8 @@ export function fileSource(file: Blob): ByteSource {
       return new Uint8Array(await file.slice(offset, end).arrayBuffer())
     },
     createSideReader: () => source,
+    // All of it is here: the timeline shows it loaded.
+    bufferedEnd: () => file.size,
   }
   return source
 }
@@ -147,6 +149,7 @@ export function bufferSource(bytes: Uint8Array | ArrayBuffer): ByteSource {
       return Promise.resolve(data.slice(offset, Math.min(offset + length, data.byteLength)))
     },
     createSideReader: () => source,
+    bufferedEnd: () => data.byteLength,
   }
   return source
 }

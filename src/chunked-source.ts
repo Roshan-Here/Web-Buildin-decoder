@@ -17,9 +17,16 @@ export interface ChunkedSourceOptions {
    * maximum size per request.
    */
   chunkSize?: number
-  /** Chunks kept in memory, most recently used first. */
+  /**
+   * Chunks kept in memory, most recently used first. Left out, it is the read ahead and a little
+   * behind it (see `fitReadAhead`), at least 32.
+   */
   cacheChunks?: number
-  /** Chunks downloaded ahead of the last read, so playback rarely waits. */
+  /**
+   * Chunks downloaded ahead of the last read, so playback rarely waits. Left out, it starts at 4
+   * and becomes about a minute and a half of the video once its length is known (the built-in
+   * decoder calls `fitReadAhead` when it opens the file); given, it stays as given.
+   */
   readAhead?: number
   /**
    * The most downloads on the link at once for work nobody waits for yet (prefetch and read
@@ -58,8 +65,11 @@ export class ChunkedSource implements ByteSource {
   readonly size: number
   readonly chunkSize: number
   private readonly fetchChunk: ChunkedSourceOptions['fetchChunk']
-  private readonly cacheChunks: number
-  private readonly readAhead: number
+  private cacheChunks: number
+  private readAhead: number
+  /** Whether the read ahead (and the cache) follow the video's length, or stay as given. */
+  private readonly fitsAhead: boolean
+  private readonly fitsCache: boolean
   private readonly concurrency: number
 
   private readonly cache = new Map<number, Uint8Array>()
@@ -80,6 +90,8 @@ export class ChunkedSource implements ByteSource {
     this.chunkSize = options.chunkSize ?? DEFAULT_CHUNK_SIZE
     this.cacheChunks = Math.max(2, options.cacheChunks ?? 32)
     this.readAhead = Math.max(0, options.readAhead ?? 4)
+    this.fitsAhead = options.readAhead === undefined
+    this.fitsCache = options.cacheChunks === undefined
     this.concurrency = Math.max(1, options.concurrency ?? 2)
   }
 
@@ -197,6 +209,34 @@ export class ChunkedSource implements ByteSource {
     const head = Array.from({ length: Math.max(0, headChunks) }, (_, i) => i)
     const tail = Array.from({ length: Math.max(0, tailChunks) }, (_, i) => this.chunkCount - 1 - i)
     this.prefetch([...head.slice(0, 1), ...tail, ...head.slice(1)])
+  }
+
+  /**
+   * Sizes the read ahead by time once the video's length is known: about [seconds] (90) of it at
+   * its average bitrate, as streaming apps keep in hand, so a skip forward of ten or thirty
+   * seconds lands on bytes already here and a weak patch of signal is ridden out; as much as the
+   * device's memory allows (`aheadCap`). The cache grows to hold it and a little behind it, so a
+   * skip back is instant too. Does nothing when `readAhead` (or `cacheChunks`) was given.
+   */
+  fitReadAhead(durationSeconds: number, options: FitReadAheadOptions = {}): void {
+    if (!this.fitsAhead) return
+    this.readAhead = readAheadChunks(this.size, durationSeconds, {
+      chunkSize: this.chunkSize,
+      ...options,
+    })
+    if (this.fitsCache) this.cacheChunks = Math.max(32, this.readAhead + KEPT_BEHIND)
+  }
+
+  /** How many chunks are read ahead of playback now. */
+  get readAheadChunks(): number {
+    return this.readAhead
+  }
+
+  bufferedEnd(offset: number): number {
+    if (offset >= this.size) return this.size
+    let index = Math.floor(Math.max(0, offset) / this.chunkSize)
+    while (index < this.chunkCount && this.cache.has(index)) index++
+    return Math.max(offset, Math.min(this.size, index * this.chunkSize))
   }
 
   /** Forgets cached chunks and queued work, and calls off the read ahead on its way. */
@@ -351,4 +391,60 @@ export class ChunkedSource implements ByteSource {
         })
     }
   }
+}
+
+/** Chunks kept behind the playhead on top of the read ahead (fitted sizes), for skips back. */
+const KEPT_BEHIND = 24
+const AHEAD_SECONDS = 90
+/** For a file whose length is not known, in 1 MiB chunks. */
+const AHEAD_UNKNOWN = 24
+const AHEAD_MIN = 12
+const AHEAD_MAX_PHONE = 40
+const AHEAD_MAX_SMALL = 64
+const AHEAD_MAX = 128
+const MiB = 1024 * 1024
+
+export interface FitReadAheadOptions {
+  /** Seconds of the video to keep downloaded ahead; 90 by default. */
+  seconds?: number
+  /** The most read ahead, in MiB; by default what the device can hold (`aheadCap`). */
+  maxMiB?: number
+}
+
+/**
+ * How much read ahead (in MiB) this device can hold: by its memory where the browser says
+ * (`navigator.deviceMemory`: 40 MiB at 2 GB or less, 64 at 4 GB, else 128), and where it does
+ * not (Safari, Firefox), 40 on a touch screen and 128 otherwise.
+ */
+export function aheadCap(
+  nav: { deviceMemory?: number; maxTouchPoints?: number } | undefined = globalThis.navigator,
+): number {
+  const memory = nav?.deviceMemory
+  if (typeof memory === 'number' && memory > 0) {
+    if (memory <= 2) return AHEAD_MAX_PHONE
+    if (memory <= 4) return AHEAD_MAX_SMALL
+    return AHEAD_MAX
+  }
+  return (nav?.maxTouchPoints ?? 0) > 0 ? AHEAD_MAX_PHONE : AHEAD_MAX
+}
+
+/**
+ * How many chunks to keep downloading ahead of playback: about [seconds] of the video at its
+ * average bitrate, so a 4K film keeps as many seconds in hand as a phone recording, at least
+ * 12 MiB and at most [maxMiB].
+ */
+export function readAheadChunks(
+  size: number,
+  durationSeconds: number,
+  {
+    seconds = AHEAD_SECONDS,
+    maxMiB = aheadCap(),
+    chunkSize = DEFAULT_CHUNK_SIZE,
+  }: FitReadAheadOptions & { chunkSize?: number } = {},
+): number {
+  const toChunks = (mib: number) => Math.max(1, Math.ceil((mib * MiB) / chunkSize))
+  const cap = toChunks(maxMiB)
+  if (!(durationSeconds > 0) || !(size > 0)) return Math.min(cap, toChunks(AHEAD_UNKNOWN))
+  const wanted = Math.ceil(((size / durationSeconds) * seconds) / chunkSize)
+  return Math.min(cap, Math.max(toChunks(AHEAD_MIN), wanted))
 }

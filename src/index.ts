@@ -18,7 +18,15 @@ export {
 } from './loader.js'
 
 export type { ByteSource } from './byte-source.js'
-export { ChunkedSource, DEFAULT_CHUNK_SIZE, type ChunkedSourceOptions } from './chunked-source.js'
+export {
+  ChunkedSource,
+  DEFAULT_CHUNK_SIZE,
+  aheadCap,
+  readAheadChunks,
+  type ChunkedSourceOptions,
+  type FitReadAheadOptions,
+} from './chunked-source.js'
+export { loadedUntil, playheadBytes, reportLoaded, withRange } from './loaded-ranges.js'
 export {
   httpSource,
   fileSource,
@@ -29,7 +37,15 @@ export {
 } from './sources.js'
 export { ByteSourceAdapter, type ByteSourceAdapterOptions } from './source-adapter.js'
 
-export { CaptionRenderer, isTextSubtitle, packetText, type Cue } from './captions.js'
+export {
+  CaptionRenderer,
+  isTextSubtitle,
+  isShownSubtitle,
+  isPictureSubtitle,
+  packetText,
+  type Cue,
+} from './captions.js'
+export type { PictureFrame, SubPicture } from './picture-subs/frame.js'
 export {
   playability,
   effectiveMimeType,

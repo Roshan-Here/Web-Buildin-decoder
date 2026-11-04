@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Roshan-Here (https://github.com/Roshan-Here) - Web-Buildin-decoder
 
+import type { PictureFrame } from './picture-subs/frame.js'
+
 /**
  * The contract between a player's controls and whatever decodes the video. The built-in
  * decoder in this package implements it; an app can implement it a second time over the
@@ -45,8 +47,13 @@ export interface TrackOption {
   language: string | null
   /** Codec and channels, for example "AC-3 5.1". */
   detail: string | null
-  /** False for tracks this decoder cannot show, such as picture subtitles. */
+  /** False for tracks this decoder cannot show. */
   selectable: boolean
+  /**
+   * A subtitle the file draws as pictures (PGS, VobSub, DVB, XSUB) rather than as text: its
+   * pictures come through `onPicture`, and its typeface and edge are part of them.
+   */
+  picture?: boolean
 }
 
 export interface TrackList {
@@ -82,6 +89,12 @@ export interface MediaEngine {
   onTracks(listener: () => void): () => void
   /** The caption text on screen changed; null when there is none. */
   onCaption(listener: (text: string | null) => void): () => void
+  /**
+   * The picture subtitles on screen changed (PGS, VobSub, DVB, XSUB): the pictures where the
+   * file puts them on its own canvas, to scale onto the picture; null when there are none.
+   * Engines that show no picture subtitles leave it out.
+   */
+  onPicture?(listener: (frame: PictureFrame | null) => void): () => void
   /** Playback failed and will not recover by itself. */
   onFailure(listener: (failure: EngineFailure) => void): () => void
   /**
